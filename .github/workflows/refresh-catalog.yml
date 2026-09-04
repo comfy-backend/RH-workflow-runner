@@ -667,8 +667,12 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const owner = context.repo.owner;
+            const owner = context.repo.owner;   // the RUNNER repo (jobs/logs live here)
             const repo = context.repo.repo;
+            // Tracking issues live in the private code repo — label + issue
+            // continuity with the pre-migration era (#6, #8, #13, cron-failed).
+            const alertOwner = 'beulahkemp';
+            const alertRepo = 'RH-workflow';
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
 
