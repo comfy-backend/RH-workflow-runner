@@ -1,0 +1,999 @@
+name: Refresh RH Catalog
+
+# Scheduled refresh of the RunningHub workflow catalog.
+# Runs daily at 09:00 UTC (incremental) + weekly Sunday 10:00 UTC (FULL).
+#
+# Pipeline (sequential, optimized):
+#   restore → reconcile → tag_tree → list (incremental) → reclassify → detail
+#   → export → analyze → models (registry crawl + resolve, freshness-gated)
+#   → apps (AI-App gallery: incremental list + missing-driven detail)
+#   → snapshot → turso_sync (best-effort, deferred failure)
+#   → data-repo sync → commit+push (race-safe) → gitlab mirror
+#   → static-UI bundle → fail-run-if-deferred-failure → cron-failure alert
+#
+# Turso sync (Phase 7), the RH model registry (Phase 5.5), and the AI-App
+# gallery (Phase 5.7) are ALL
+# best-effort with DEFERRED failure: an external-side failure (Turso plan
+# quota, RH registry outage) never skips the data-repo sync / commit+push /
+# GitLab mirror — the failure is re-raised AFTER data backup so the run
+# still turns red and the cron-failed alert fires. (A hard coupling here
+# caused a 7-day silent data gap, 2026-08-24 → 2026-08-31.)
+#
+# A fast `test` job gates every run (push / PR / schedule / dispatch).
+#
+# Total wall-clock time: ~10 min (incremental) / ~25 min (full refresh with
+# Turso sync) / ~2.5-3h (first v2 backfill: .cn enrollment + .ai app gallery).
+#
+# RUNNER CONTEXT (public-repo compute host): this workflow lives in the PUBLIC
+# comfy-backend/RH-workflow-runner repo for unlimited Actions minutes (the
+# beulahkemp account's Actions is billing-blocked, issue #13). All code and
+# data live in PRIVATE repos, checked out via the GH_PAT secret; every
+# credential is an encrypted Actions secret, auto-redacted from these PUBLIC
+# logs. Nothing sensitive is ever committed to this repo. Tracking issues
+# (cron-failed / turso-quota) are filed in the PRIVATE code repo via GH_PAT.
+
+on:
+  schedule:
+    # Daily at 09:00 UTC = 02:00 PT (avoid peak RH traffic)
+    - cron: '0 9 * * *'
+    # Weekly FULL refresh Sunday 10:00 UTC. The daily incremental (sort=NEW,
+    # early-stop on known workflows) misses stragglers: useCount/rank updates,
+    # workflows re-sorted out of NEW order, and anything RH re-publishes. The
+    # weekly full crawl re-walks ALL list pages and reconciles the catalog.
+    # Detected via github.event.schedule == '0 10 * * 0' (Phase 2) — schedule
+    # events can't carry workflow_dispatch inputs, so the cron string itself
+    # is the signal. Offset +1h from the daily run; the 'refresh-catalog'
+    # concurrency group serializes them anyway.
+    - cron: '0 10 * * 0'
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: 'Force a FULL list crawl (re-crawl all pages, ~48 min). Default: incremental (~1 min).'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      priority_only:
+        description: 'Only fetch detail+export for video/audio/image workflows (skip misc)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['false', 'true']
+      skip_turso:
+        description: 'Skip Turso sync (faster, but no cloud backup)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      full_turso_sync:
+        description: 'Force a FULL Turso push instead of incremental (use after schema/analyzer changes)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  push:
+    branches: [main]
+
+# (No pull_request trigger: this repo accepts no PRs — it hosts workflow
+# definitions only.)
+
+permissions:
+  contents: write  # required by the refresh job (commit + push); scoped per-job below
+
+concurrency:
+  # Refresh runs (schedule/dispatch) serialize together. Test-only runs
+  # (push/PR) get a UNIQUE group so they never queue behind a 1-hour refresh.
+  group: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && format('test-{0}', github.run_id) || 'refresh-catalog' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code repo (private, via PAT)
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/RH-workflow
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v --tb=short
+
+  refresh:
+    name: Refresh catalog
+    needs: test
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Worst case is the first run after a cache-key change OR the FIRST
+    # dual-domain backfill (v2: ~16.4k .cn details+exports+analysis ≈ 25-35
+    # min, ~96k .ai app details ≈ 40 min on top of the ~60-min baseline,
+    # plus data-repo restore ~1.5GB): ≈ 2.5-3h at 1.6x headroom. All
+    # crawl phases are missing-driven so a timeout kill self-heals next
+    # run; the .cn list walk recovers via a full_refresh dispatch.
+    timeout-minutes: 300
+    permissions:
+      contents: write
+      # Permissions below apply to the RUNNER repo's GITHUB_TOKEN only. The
+      # cross-repo operations (private-repo issue filing, private-repo pushes)
+      # all authenticate via the GH_PAT secret, which carries its own scopes.
+      actions: write  # cache entries + listJobsForWorkflowRun (alert step)
+      issues: write  # kept for a future alert step that files issues HERE
+    env:
+      RH_DATA_REPO: /tmp/rh-data-repo
+    steps:
+      - name: Check out code repo (private, via PAT)
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/RH-workflow
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Record code-repo SHA (alert triage context)
+        # The alert step reports THIS repo's sha by default (the workflow-file
+        # commit — useless for bisecting pipeline regressions). Capture the
+        # private code-repo HEAD the pipeline actually runs on.
+        run: echo "CODE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure Git
+        run: |
+          # --global: the data-repo clone (Phase 8) needs an identity too —
+          # per-repo config on the code checkout would NOT cover it.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Free runner disk space
+        run: |
+          # ubuntu-latest images ship ~8-10GB of toolchains we never use.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Restore cached DB + files
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/catalog.db
+            data/exports/
+            data/details/
+          key: rh-catalog-v3-${{ github.run_id }}
+          restore-keys: |
+            rh-catalog-v3-
+
+      - name: Restore DB from data repo (if cache missed)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ ! -f data/catalog.db ] || [ "$(stat -c%s data/catalog.db)" -lt 1000000 ]; then
+            echo "Cache missed — restoring from data repo"
+            if [ -z "$GH_PAT" ]; then
+              echo "GH_PAT not set and cache missed — starting from an EMPTY DB (full re-crawl)"
+              exit 0
+            fi
+            git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"
+            cd "$RH_DATA_REPO"
+            # git-lfs ships preinstalled on ubuntu-latest runners
+            git lfs install
+            git lfs pull --include="catalog.db"
+            # Verify we got the real DB, not a ~130-byte LFS pointer file.
+            if [ "$(stat -c%s catalog.db)" -lt 1000000 ]; then
+              echo "FATAL: catalog.db is still an LFS pointer after pull — aborting"
+              exit 1
+            fi
+            cd -
+            cp "$RH_DATA_REPO/catalog.db" data/catalog.db
+            # Restore export files from the data repo working tree. The data
+            # repo stores them SHARDED (exports/20/<id>.json) but the pipeline
+            # uses FLAT paths (data/exports/<id>.json) — flatten while copying.
+            if [ -d "$RH_DATA_REPO/exports" ]; then
+              mkdir -p data/exports
+              (cd "$RH_DATA_REPO/exports" && find . -mindepth 2 -name '*.comfyui.json' -exec cp -t "$GITHUB_WORKSPACE/data/exports" {} +)
+              echo "Restored $(find data/exports -name '*.comfyui.json' | wc -l) export files from data repo"
+            fi
+            # The data-repo working copies are redundant now (Phase 8 compares
+            # against HEAD blobs and re-copies from data/ on change) — free ~5.6GB.
+            rm -rf "$RH_DATA_REPO/exports" "$RH_DATA_REPO/catalog.db"
+            df -h / | tail -1
+          else
+            echo "Cache hit — DB present ($(stat -c%s data/catalog.db) bytes)"
+          fi
+
+      - name: Reconcile marks vs on-disk files
+        run: |
+          if [ -f data/catalog.db ]; then
+            python3 -m rh_catalog.cli reconcile
+          else
+            echo "No DB yet — skipping reconcile"
+          fi
+
+      - name: Phase 1 — Tag tree
+        run: python3 -m rh_catalog.cli --log-level INFO crawl --phase tag_tree
+
+      - name: Phase 2 — List crawl
+        run: |
+          # Full crawl when: manual dispatch asked for it, OR this run was
+          # triggered by the weekly Sunday schedule (github.event.schedule
+          # carries the exact cron string that fired this run).
+          if [ "${{ github.event.inputs.full_refresh }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 10 * * 0" ]; then
+            echo "Full refresh — crawling all pages (slow, ~48 min)"
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase list --full
+          else
+            echo "Incremental crawl — sort=NEW, stop early when hitting existing workflows (~1 min)"
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase list --incremental
+          fi
+
+      - name: Phase 2.5 — .cn list crawl (the v2 second source, runninghub.cn)
+        run: |
+          # The .cn regional catalog (same workflow-id space, ~16.4k net-new
+          # ids, divergence measured 2026-06-25). Branches on full/Sunday
+          # exactly like Phase 2: the FIRST run's incremental is degenerate-
+          # full (empty .cn stop-set walks all ~392 pages), and a walk killed
+          # mid-crawl recovers via a full_refresh dispatch (daily
+          # incrementals alone cannot reach a deep un-enrolled tail).
+          if [ "${{ github.event.inputs.full_refresh }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 10 * * 0" ]; then
+            echo ".cn full refresh — re-walking all ~392 pages (~16 min)"
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase list --full --domain cn
+          else
+            echo ".cn incremental crawl (~2-3 pages/day at ~700 new .cn workflows/day)"
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase list --incremental --domain cn
+          fi
+
+      - name: Re-classify media types
+        run: python3 scripts/reclassify_media.py
+
+      - name: Show stats after list crawl
+        run: python3 -m rh_catalog.cli stats
+
+      - name: Phase 3 — Detail crawl
+        run: |
+          if [ "${{ github.event.inputs.priority_only }}" = "false" ]; then
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase detail --no-priority-only
+          else
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase detail --priority-only --limit 50000
+          fi
+
+      - name: Phase 4 — Export crawl
+        run: |
+          if [ "${{ github.event.inputs.priority_only }}" = "false" ]; then
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase export --no-priority-only
+          else
+            python3 -m rh_catalog.cli --log-level INFO crawl --phase export --priority-only --limit 50000
+          fi
+
+      - name: Phase 5 — Analyze
+        run: python3 -m rh_catalog.cli --log-level INFO analyze --no-priority-only
+
+      - name: Phase 5.5 — RH model registry (crawl if stale + resolve refs)
+        id: models_reg
+        # Track A's top unturned stone: the public /api/portal/model/list
+        # registry (~61k models with canonical storage paths). Freshness-
+        # gated (skips the ~620-page crawl when the last one is < 7 days old);
+        # resolve is cheap local DB work and runs every time. Answers "is this
+        # model RH-hosted or bring-your-own?" for every catalog model ref.
+        #
+        # DEFERRED-FAILURE pattern (peer-review P2, same class as the Turso
+        # fix): a NEW weekly external API dependency must never sit in the
+        # hard-fail path — an RH registry outage or response-shape change
+        # would skip snapshot, Turso, data-repo backup, and the GitLab mirror
+        # (exactly the failure class that caused the 7-day silent data gap,
+        # 2026-08-24 → 2026-08-31). The failure is re-raised AFTER data backup
+        # by "Fail run if a deferred failure is pending" so the run still
+        # turns red and the cron-failure alert fires.
+        continue-on-error: true
+        run: python3 -m rh_catalog.cli --log-level INFO models --crawl --resolve
+
+      - name: Record model-registry step status
+        run: |
+          outcome="${{ steps.models_reg.outcome }}"
+          echo "model-registry step outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "MODELS_STEP_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::RH model-registry step failed (Phase 5.5) — CONTINUING; the run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "MODELS_STEP_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Phase 5.7 — AI-App gallery crawls (webapp list + detail — BOTH galleries)
+        id: apps_crawl
+        # Track C + v2: the public AI-App galleries — runninghub.cn (~90k
+        # apps, the v1 surface) AND runninghub.ai (~96k apps, disjoint id
+        # space) — plus each app->workflowId mapping (powers the "backed by
+        # an app" facet + the discovery upside measurement). Daily:
+        # incremental list (early-stop, ~2-3 pages/domain) + detail for new
+        # apps; Sunday full: all list pages (counter refresh + per-domain
+        # GC) + remaining details. First run after v2 merge populates ~96k
+        # .ai rows (~40 min at ~40 details/s) — missing-driven, so it
+        # self-completes across runs even if capped by the job timeout.
+        #
+        # DEFERRED-FAILURE (same doctrine as Phase 5.5 — peer-reviewed): the
+        # app surfaces are additive THIRD catalog entities; a gallery outage
+        # must never skip the workflow refresh/backup steps. Re-raised after
+        # data backup via APPS_CRAWL_FAILED.
+        #
+        # ORDERING: .ai FIRST (the new ~96k surface must not be skipped when
+        # .cn fails), non-short-circuit sequencing with an aggregated exit
+        # code so one domain's failure defers red but the other still runs.
+        continue-on-error: true
+        run: |
+          mode_args="--incremental"
+          if [ "${{ github.event.schedule }}" = "0 10 * * 0" ] || [ "${{ github.event.inputs.full_refresh }}" = "true" ]; then
+            echo "App galleries FULL crawl (all pages + GC, both domains)"
+            mode_args=""
+          else
+            echo "App galleries incremental (early-stop) + missing-driven detail (both domains)"
+          fi
+          rc=0
+          python3 -m rh_catalog.cli --log-level INFO apps --domain ai --crawl $mode_args --detail || rc=1
+          python3 -m rh_catalog.cli --log-level INFO apps --domain cn --crawl $mode_args --detail || rc=1
+          exit $rc
+
+      - name: Record app-gallery step status
+        run: |
+          outcome="${{ steps.apps_crawl.outcome }}"
+          echo "app-gallery step outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "APPS_CRAWL_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::AI-App gallery crawl failed (Phase 5.7) — CONTINUING; the run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "APPS_CRAWL_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Phase 6 — Snapshot
+        run: python3 -m rh_catalog.cli snapshot
+
+      - name: Show final stats
+        run: python3 -m rh_catalog.cli stats
+
+      - name: Phase 7 — Sync to Turso (native SDK, best-effort)
+        id: turso
+        # BEST-EFFORT + DEFERRED FAILURE: Turso is a secondary backup
+        # destination; the data repo (Phase 8) + this code repo are primary.
+        # A Turso-side failure (free-plan write quota was exhausted
+        # 2026-08-24 → 2026-08-31, blocking writes with "BLOCKED") must NOT
+        # skip Phase 8 / commit+push / GitLab mirror — that hard coupling
+        # caused a 7-day silent data gap. The next step records the outcome;
+        # "Fail run if Turso sync failed" (after data backup) re-raises it.
+        #
+        # EXIT-CODE CONTRACT: the sync exits 75 specifically for the
+        # free-plan WRITE-QUOTA BLOCK (self-heals on the 1st of the month).
+        # That is an EXPECTED condition, not a pipeline failure: we translate
+        # it to exit 0 + TURSO_QUOTA_BLOCKED=true so the run stays green and
+        # the cron-failure alert does NOT fire; the `turso-quota` tracking
+        # issue (managed by the alert step below) carries the signal instead.
+        # Any other non-zero exit stays a real (deferred) failure.
+        continue-on-error: true
+        if: github.event.inputs.skip_turso != 'true'
+        env:
+          TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
+          TURSO_DB_TOKEN: ${{ secrets.TURSO_DB_TOKEN }}
+          # Dispatch input via env (not inline ${{ }} interpolation) — the
+          # canonical script-injection-safe pattern for workflow inputs.
+          INPUT_FULL_TURSO_SYNC: ${{ github.event.inputs.full_turso_sync }}
+        run: |
+          if [ -z "$TURSO_DB_URL" ] || [ -z "$TURSO_DB_TOKEN" ]; then
+            echo "TURSO_DB_URL or TURSO_DB_TOKEN not set — skipping sync"
+            exit 0
+          fi
+          # Mark that a sync ACTUALLY RAN (creds present) — the alert step
+          # needs this to distinguish "clean sync" from "sync skipped /
+          # credentials unset" when deciding whether the Turso replica is
+          # healthy again (a skipped sync must NOT close the turso-quota
+          # tracking issue with a false "re-synced" claim).
+          echo "TURSO_SYNC_RAN=true" >> "$GITHUB_ENV"
+          ARGS=""
+          if [ "${INPUT_FULL_TURSO_SYNC:-}" = "true" ]; then
+            ARGS="--full"
+          fi
+          set +e
+          python3 -m rh_catalog.sync_turso $ARGS
+          rc=$?
+          set -e
+          if [ "$rc" -eq 75 ]; then
+            echo "TURSO_QUOTA_BLOCKED=true" >> "$GITHUB_ENV"
+            echo "::warning::Turso free-plan write quota exhausted — replica stale until the quota resets (1st of next month). EXPECTED + self-healing: this run stays green; the turso-quota tracking issue carries the signal."
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Record Turso sync status
+        # Runs regardless of Phase 7's outcome (continue-on-error on the
+        # previous step means this step always runs; outcome is 'failure',
+        # 'success', or 'skipped' when skip_turso=true was requested — note a
+        # quota-blocked sync is translated to exit 0 above, so it reports
+        # 'success' here and only REAL failures reach the failure branch).
+        run: |
+          outcome="${{ steps.turso.outcome }}"
+          echo "Turso sync outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "TURSO_SYNC_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Turso sync failed — CONTINUING (the data repo is the primary backup). The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "TURSO_SYNC_FAILED=false" >> "$GITHUB_ENV"
+          fi
+          if [ "${outcome}" = "skipped" ]; then
+            # Explicitly clear the ran-marker for skipped syncs (dispatch with
+            # skip_turso=true): TURSO_SYNC_RAN unset would ALSO read as
+            # "did not run", but being explicit survives env-ordering surprises.
+            echo "TURSO_SYNC_RAN=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Disk usage before data-repo sync
+        run: df -h / | tail -1
+
+      - name: Phase 8 — Sync to data repo (SQLite DB + snapshot + JSON exports)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
+          RH_DATA_REPO: ${{ env.RH_DATA_REPO }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "GH_PAT not set — skipping data repo sync"
+            exit 0
+          fi
+          # Reuse the clone from the restore step when present; else fresh clone.
+          if [ ! -d "$RH_DATA_REPO/.git" ]; then
+            git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"
+          else
+            git -C "$RH_DATA_REPO" remote set-url origin "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git"
+          fi
+          git -C "$RH_DATA_REPO" lfs install || true
+          # Make sure the LFS working copy of catalog.db is present (restore
+          # step may have skipped LFS pull on cache-hit runs).
+          if [ ! -s "$RH_DATA_REPO/catalog.db" ] || [ "$(stat -c%s "$RH_DATA_REPO/catalog.db")" -lt 1000000 ]; then
+            git -C "$RH_DATA_REPO" lfs pull --include="catalog.db" || true
+          fi
+          python3 scripts/chunked_data_sync.py --chunk-size 5000 --data-repo "$RH_DATA_REPO"
+
+      - name: Free data-repo clone before cache save
+        run: |
+          # The cache-save post step tars data/ (~6GB) — free the data-repo
+          # clone's .git (~1.7GB) first so the tar fits on the runner disk.
+          rm -rf "$RH_DATA_REPO"
+          df -h / | tail -1
+
+      - name: Commit + push (race-safe)
+        run: |
+          git add data/snapshots/catalog-preview.json FINDINGS.md OPERATIONS.md README.md HANDOFF.md rh_catalog/ scripts/ tests/ requirements.txt requirements-dev.txt .github/
+          # The legacy 10 MB snapshot no longer lives in the code repo (it now
+          # ships gzipped via the data repo). Drop it from the index if present.
+          git rm --cached --ignore-unmatch data/snapshots/catalog.json >/dev/null 2>&1 || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: daily catalog refresh ($(date -u +%Y-%m-%d))"
+            for i in 1 2 3; do
+              if git pull --rebase --autostash origin main && git push; then
+                echo "Pushed on attempt $i"
+                exit 0
+              fi
+              # A conflicted rebase leaves the repo mid-rebase; reset to a
+              # clean state before retrying (next attempt re-runs the rebase).
+              git rebase --abort >/dev/null 2>&1 || true
+              echo "Push attempt $i failed (remote moved?) — retrying in 20s"
+              sleep 20
+            done
+            echo "ERROR: push failed after 3 attempts"
+            exit 1
+          fi
+
+      - name: Push to GitLab (redundant backup)
+        env:
+          GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
+        run: |
+          if [ -z "$GITLAB_PAT" ]; then
+            echo "GITLAB_PAT not set — skipping GitLab push"
+            exit 0
+          fi
+          git remote get-url gitlab >/dev/null 2>&1 || \
+            git remote add gitlab "https://oauth2:${GITLAB_PAT}@gitlab.com/ansgareutychisO/RH-workflow.git"
+          for i in 1 2 3 4 5; do
+            if git push gitlab HEAD:main; then
+              echo "GitLab push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "GitLab push attempt $i failed — waiting $((i * 30))s"
+            sleep $((i * 30))
+          done
+          echo "GitLab push failed after 5 attempts — will retry next run"
+          exit 0
+
+      # ---------------------------------------------------------------------
+      # Offline static-UI bundle (Track F — alternative to GitHub Pages).
+      # Per project policy, NO repos are public; GitHub Pages on a free
+      # account requires the source repo to be public, so we ship the static
+      # UI as a downloadable artifact instead. Users download this zip from
+      # the Actions tab, unzip it, run `python3 -m http.server` from inside,
+      # and open http://localhost:8000/. The bundle contains the UI files
+      # AND the latest catalog.json.gz so the same-origin fetch in app.js
+      # resolves without any external auth.
+      # ---------------------------------------------------------------------
+      - name: Bundle static UI + snapshot for offline use
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          set -e
+          mkdir -p /tmp/static-ui-bundle
+          cp docs/index.html docs/app.js docs/style.css docs/README.md /tmp/static-ui-bundle/
+          if [ -f data/snapshots/catalog.json.gz ] && [ "$(stat -c%s data/snapshots/catalog.json.gz)" -gt 1000 ]; then
+            cp data/snapshots/catalog.json.gz /tmp/static-ui-bundle/
+            echo "Snapshot included ($(stat -c%s data/snapshots/catalog.json.gz) bytes)"
+            # When the snapshot is bundled, the offline UI works fully —
+            # the SPA fetches catalog.json.gz same-origin.
+            cat > /tmp/static-ui-bundle/USAGE.txt <<USAGE
+          RH Workflow Catalog — Offline UI Bundle (with snapshot)
+          ========================================================
+          Generated: $(date -u)
+
+          This bundle contains the static UI (index.html, app.js, style.css)
+          AND the catalog snapshot (catalog.json.gz). The SPA fetches the
+          snapshot same-origin, so no external network access is required.
+
+          Usage:
+            1. Unzip this bundle (you're reading USAGE.txt, so you probably did).
+            2. From this directory, start a static server:
+                 python3 -m http.server 8000
+            3. Open http://localhost:8000/ in your browser.
+
+          See docs/README.md in the source repo for the full architecture.
+          USAGE
+          else
+            echo "WARNING: no snapshot at data/snapshots/catalog.json.gz — bundle is UI-only"
+            # UI-only bundle: be honest in the usage instructions so a user
+            # doesn't expect the catalog to load. Direct them to the next
+            # successful run's bundle (which WILL include the snapshot).
+            cat > /tmp/static-ui-bundle/USAGE.txt <<USAGE
+          RH Workflow Catalog — Offline UI Bundle (UI-only, no snapshot)
+          =================================================================
+          Generated: $(date -u)
+
+          This bundle contains the static UI (index.html, app.js, style.css)
+          but NOT the catalog snapshot (catalog.json.gz). The SPA will fail
+          to fetch './catalog.json.gz' and show an error banner.
+
+          This happens when the bundle step ran on a refresh that didn't
+          reach the snapshot phase (e.g., a failed run, or a workflow_dispatch
+          run with skip_snapshot=true). Download the bundle from the latest
+          SUCCESSFUL Refresh run instead — that bundle will include the
+          snapshot and work offline without any external network access.
+
+          See docs/README.md in the source repo for the full architecture.
+          USAGE
+          fi
+          # Flatten the zip's top level — `cd /tmp && zip -r -q static-ui-bundle.zip static-ui-bundle/`
+          # would produce a zip whose only top-level entry is `static-ui-bundle/`, forcing the
+          # user to cd into that subdirectory after unzip. Zipping from INSIDE the bundle dir
+          # means the zip's top-level entries are the files themselves (index.html, app.js,
+          # style.css, catalog.json.gz, README.md, USAGE.txt) — so
+          #   `unzip static-ui-bundle.zip -d static-ui && cd static-ui && python3 -m http.server 8000`
+          # works as documented in docs/README.md.
+          cd /tmp/static-ui-bundle && zip -r -q /tmp/static-ui-bundle.zip .
+          ls -la /tmp/static-ui-bundle.zip
+
+      - name: Upload static-UI bundle artifact
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-ui-bundle
+          path: /tmp/static-ui-bundle.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Fail run if a deferred failure is pending (after data backup)
+        # DEFERRED FAILURES re-raised here: Phase 5.5 (model registry),
+        # Phase 7 (Turso), and Phase 8 data-repo PUSH outcomes all run with
+        # continue-on-error / green-exit semantics, so the pipeline completes
+        # the data-repo sync, commit+push, GitLab mirror, and the offline-UI
+        # bundle FIRST. Only then do we fail the run, so:
+        #   1. the Actions tab shows red (operators see it), and
+        #   2. the cron-failure alert step (next) sees a failed step and
+        #      opens the tracking issue.
+        # No data backup is ever skipped because an external mirror had a
+        # bad day; all of them heal on their next successful run. This is
+        # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
+        # for a month) gets surfaced: chunked_data_sync.py exports
+        # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
+        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true')
+        run: |
+          failed=0
+          if [ "${TURSO_SYNC_FAILED:-false}" = "true" ]; then
+            echo "::error::Turso sync failed earlier in this run (Phase 7 — deferred). Data backup to the data repo + GitLab + the offline bundle completed; Turso (secondary mirror) is stale. Turso will self-heal on the next successful sync."
+            failed=1
+          fi
+          if [ "${MODELS_STEP_FAILED:-false}" = "true" ]; then
+            echo "::error::RH model-registry step failed earlier in this run (Phase 5.5 — deferred). Data backup completed; the registry tables (rh_model / model_match) are stale. The next run retries the crawl (freshness not recorded on failure)."
+            failed=1
+          fi
+          if [ "${APPS_CRAWL_FAILED:-false}" = "true" ]; then
+            echo "::error::AI-App gallery crawl failed earlier in this run (Phase 5.7 — deferred). Data backup completed; the rh_app gallery table is stale. The next run retries (list incremental is cheap; detail is missing-driven and resumable)."
+            failed=1
+          fi
+          if [ "${DATA_PUSH_FAILED:-false}" = "true" ]; then
+            echo "::error::Data-repo pushes failed earlier in this run (Phase 8 — deferred, remotes: ${DATA_PUSH_FAILED_REMOTES:-unknown}). The local catalog.db/exports sync and all later backup steps completed, but the listed remote(s) may be STALE. A fast-forward-only push could not advance them (see the Phase 8 log for the exact reason: divergence / remote ahead / retries exhausted)."
+            failed=1
+          fi
+          if [ "${failed}" = "1" ]; then
+            # Marker for the alert step (same job, no API lag): the jobs-API
+            # step list can lag seconds behind reality — on 2026-09-02 the
+            # alert ran 1.2s after this step failed, read a stale list, and
+            # wrongly closed the tracking issue as "Resolved".
+            echo "DEFERRED_FAILURE_RAISED=true" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # Cron failure alerting (Track D, top recommendation).
+      # Runs on every refresh run (always()), regardless of prior step
+      # outcomes. Internally branches on the refresh JOB's conclusion:
+      #   - FAILURE   → open (or comment on) a "cron-failed" tracking issue
+      #     carrying the run URL + failed step names, so operators see a
+      #     single rolling issue instead of one-per-failure.
+      #   - SUCCESS   → close any open "cron-failed" issue with a
+      #     "Resolved by run <url>" comment (auto-recovery signal).
+      #   - CANCELLED → leave any existing tracking issue unchanged. A
+      #     cancelled run produces no failed steps; using failedSteps alone
+      #     would incorrectly close an active tracking issue.
+      #
+      # Filter `issues.listForRepo` results to exclude pull requests: a PR
+      # carrying the `cron-failed` label would otherwise be modified instead
+      # of (or in addition to) the intended tracking issue.
+      # ---------------------------------------------------------------------
+      - name: Auto-create/close cron-failed tracking issue
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+
+            // Find the *refresh* job in this run and read its overall conclusion.
+            //
+            // IMPORTANT: at alert-step time, this step runs INSIDE the refresh
+            // job as the LAST step. The job's `status` is `in_progress` and
+            // `conclusion` is `null` (the job hasn't completed — the alert
+            // step itself is what will complete it). So `jobConclusion` alone
+            // CANNOT be used as the failure signal — it would always be null
+            // at this point, and a real failure would be a silent no-op.
+            //
+            // Correct signals:
+            //   - failedSteps.length > 0  — RELIABLE failure signal (set as
+            //     each prior step completes; populated before the alert step
+            //     runs).
+            //   - jobConclusion === 'cancelled' — RELIABLE cancelled signal
+            //     (only true after a cancellation; the alert step may not
+            //     even reach this point on a hard cancel, but if it does, we
+            //     preserve the tracking issue).
+            //   - jobConclusion === 'success' — set when the job ends
+            //     successfully. At alert time this is null; we use the
+            //     absence of failures as the success proxy.
+            const { data: jobsPage } = await github.rest.actions.listJobsForWorkflowRun({
+              owner,
+              repo,
+              run_id: context.runId,
+              per_page: 100,
+            });
+            const refreshJob = (jobsPage.jobs || []).find(j => j.name === 'Refresh catalog');
+            const jobConclusion = refreshJob?.conclusion; // 'success' | 'failure' | 'cancelled' | null
+            // failedSteps: populated by GitHub as each prior step completes;
+            // reliable BEFORE the job concludes.
+            const failedSteps = (refreshJob?.steps || [])
+              .filter(s => s.conclusion === 'failure')
+              .map(s => s.name);
+            const hasFailures = failedSteps.length > 0;
+            // Cancelled signal: only true after a cancellation; preserves the
+            // tracking issue (a cancelled run is NOT a recovery).
+            const isCancelled = jobConclusion === 'cancelled';
+            // ENV-FLAG BACKSTOP: the jobs API can LAG seconds behind step
+            // conclusions (observed 2026-09-02: the alert ran 1.2s after
+            // the fail-run step failed, read a STALE step list showing no
+            // failures, and wrongly closed the tracking issue as
+            // "Resolved" while the run was actually red). The
+            // deferred-failure env flags are written by steps in THIS SAME
+            // job — they cannot lag. hasFailures/jobConclusion stay in the
+            // OR-chain to catch direct step failures the flags don't cover.
+            const deferredFailureRaised =
+              process.env.TURSO_SYNC_FAILED === 'true' ||
+              process.env.MODELS_STEP_FAILED === 'true' ||
+              process.env.APPS_CRAWL_FAILED === 'true' ||
+              process.env.DATA_PUSH_FAILED === 'true' ||
+              process.env.DEFERRED_FAILURE_RAISED === 'true';
+            // Failure signal: prior step(s) failed OR jobConclusion (post-run)
+            // is 'failure' OR a deferred-failure flag is set. The first clause
+            // handles the in-progress alert case; the second is a backstop for
+            // the post-completion case; the third is lag-proof.
+            const isFailure = hasFailures || jobConclusion === 'failure' || deferredFailureRaised;
+            // Success signal: NOT cancelled, NOT failed (by any signal).
+            // The `jobConclusion` null case (alert runs mid-job) is treated
+            // as success ONLY if no failure signal exists — the alert step
+            // itself succeeding completes the job as success (it's the last
+            // step). This auto-closes the tracking issue on recovery.
+            const isSuccess = !isCancelled && !isFailure &&
+              (jobConclusion === 'success' || jobConclusion === null);
+
+            // Any open "cron-failed" tracking ISSUES (not PRs)?
+            // The GitHub issues API conflates issues + PRs under /issues;
+            // pull_request is null for true issues and a dict for PRs.
+            // We must filter PRs out before commenting/closing — otherwise
+            // a PR with the cron-failed label could be modified instead.
+            const { data: allOpen } = await github.rest.issues.listForRepo({
+              owner: alertOwner,
+              repo: alertRepo,
+              state: 'open',
+              labels: 'cron-failed',
+              per_page: 100,
+            });
+            const existing = allOpen.filter(i => !i.pull_request);
+
+            // ----------------------------------------------------------------
+            // turso-quota issue lifecycle — INDEPENDENT of cron-failure
+            // handling. A Turso quota block is its own signal: a red run
+            // caused by ANOTHER deferred failure (models step, data pushes)
+            // must NOT mute the quota issue's creation or daily liveness
+            // comment. Conversely, a clean-ran sync (no quota block) closes
+            // any open quota issues even on an otherwise-red run — Turso
+            // itself IS healthy again. A sync that did not run at all
+            // (skipped / credentials unset) provides no evidence either way
+            // and leaves the issues unchanged.
+            // CANCELLED runs preserve everything (same semantics as the
+            // cron-failed branch below: a cancelled run is not a recovery
+            // and not a signal).
+            // ----------------------------------------------------------------
+            if (isCancelled) {
+              core.info('Refresh run was cancelled — leaving turso-quota issue(s) unchanged.');
+            } else
+            {
+            const isQuota = process.env.TURSO_QUOTA_BLOCKED === 'true';
+            // Did a sync actually RUN this cycle? (false for dispatch
+            // skip_turso=true, or credentials unset — Phase 7 exports the
+            // marker only when it really invokes the sync.) A sync that
+            // did NOT run provides no evidence either way, so it must NOT
+            // close the turso-quota issue with a false "re-synced" claim.
+            const tursoRan = process.env.TURSO_SYNC_RAN === 'true';
+            // A sync that RAN but FAILED (a real error — not the quota
+            // block, which never sets this flag: exit 75 is translated to
+            // success) provides no evidence the replica recovered and must
+            // not close quota issues with a false "re-synced" claim.
+            const tursoFailed = process.env.TURSO_SYNC_FAILED === 'true';
+
+            // --- turso-quota issue lifecycle ---
+            const { data: quotaOpen } = await github.rest.issues.listForRepo({
+              owner: alertOwner,
+              repo: alertRepo,
+              state: 'open',
+              labels: 'turso-quota',
+              per_page: 100,
+            });
+            const quotaIssues = quotaOpen.filter(i => !i.pull_request);
+
+            if (isQuota) {
+              const quotaBody = [
+                'The Turso (secondary) replica cannot accept writes: the free-plan write quota is exhausted.',
+                '',
+                '**Status:** the primary backups (data repo + GitLab mirror + offline bundle) are UNAFFECTED — this is a secondary-mirror-only condition.',
+                '',
+                '**Self-heal:** the quota resets on the 1st of the next month; the first sync after that re-pushes everything since the last watermark (at-least-once — no data is lost).',
+                '',
+                `First observed this window: run ${runUrl}`,
+                '',
+                '> Tracking issue — auto-closed by the first fully-clean Turso sync (no `turso-quota` label updates needed).',
+                '> A `cron-failed` red run is NOT expected for this condition by design.',
+              ].join('\n');
+              if (quotaIssues.length === 0) {
+                // Create the tracking issue (label first — POST /issues
+                // with an unknown label 422s, same pattern as cron-failed).
+                try {
+                  await github.rest.issues.create({
+                    alertOwner,
+                    alertRepo,
+                    title: 'Turso replica stale — free-plan write quota exhausted',
+                    body: quotaBody,
+                    labels: ['turso-quota'],
+                  });
+                  core.info('Created turso-quota tracking issue.');
+                } catch (e) {
+                  if (e.status === 422 && /Label/i.test(e.message || '')) {
+                    await github.rest.issues.createLabel({
+                      alertOwner, alertRepo, name: 'turso-quota',
+                      color: 'fbca04', // yellow: expected/known condition, not an outage
+                      description: 'Turso free-plan write quota exhausted — replica stale, self-heals monthly',
+                    });
+                    await github.rest.issues.create({
+                      alertOwner,
+                      alertRepo,
+                      title: 'Turso replica stale — free-plan write quota exhausted',
+                      body: quotaBody,
+                      labels: ['turso-quota'],
+                    });
+                    core.info('Created turso-quota label + tracking issue.');
+                  } else {
+                    throw e;
+                  }
+                }
+              } else {
+                // Daily liveness comment (deduped per UTC day so manual
+                // re-dispatches don't spam).
+                const issue = quotaIssues[0];
+                const lastTouched = (issue.updated_at || '').slice(0, 10);
+                if (lastTouched !== today) {
+                  await github.rest.issues.createComment({
+                    alertOwner,
+                    alertRepo,
+                    issue_number: issue.number,
+                    body: `Still quota-blocked — replica remains stale (expected). Run ${runUrl}`,
+                  });
+                  core.info(`Appended daily comment to turso-quota issue #${issue.number}.`);
+                } else {
+                  core.info(`turso-quota issue #${issue.number} already updated today — skipping comment.`);
+                }
+              }
+            } else if (quotaIssues.length > 0 && tursoRan && !tursoFailed) {
+              // Turso healthy again (a sync RAN, no quota block, no
+              // failure) → close the tracking issues.
+              for (const issue of quotaIssues) {
+                await github.rest.issues.createComment({
+                  alertOwner,
+                  alertRepo,
+                  issue_number: issue.number,
+                  body: `Quota window has ended — Turso writes are available again; the replica re-synced with run ${runUrl}`,
+                });
+                await github.rest.issues.update({
+                  alertOwner,
+                  alertRepo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                });
+                core.info(`Closed turso-quota issue #${issue.number} (re-synced by ${runUrl}).`);
+              }
+            } else if (quotaIssues.length > 0 && !tursoRan) {
+              core.info('Turso sync did not run this cycle (skipped / credentials unset) — leaving turso-quota issue(s) open unchanged.');
+            } else if (quotaIssues.length > 0 && tursoRan && tursoFailed) {
+              core.info('Turso sync ran but FAILED this cycle — replica state unknown; leaving turso-quota issue(s) open unchanged.');
+            }
+
+            // End of turso-quota lifecycle.
+            }
+
+            if (isFailure) {
+              const failedLines = failedSteps.length
+                ? failedSteps.map(s => `- \`${s.replace(/`/g, '\\`')}\``)
+                : ['- (step-level status unavailable at alert time — see run logs)'];
+              if (existing.length === 0) {
+                // No open tracking issue → create one.
+                // Pre-create the `cron-failed` label if it doesn't exist
+                // (POST /issues with an unknown label 422s; createLabel
+                // first then retry the issue-create).
+                // Body includes triage context: trigger, commit SHA (for
+                // bisecting "did the last deploy break this?"), branch, run #.
+                const headerLine = [
+                  `**Trigger:** \`${context.eventName}\``,
+                  `**Runner repo commit:** \`${context.sha.slice(0, 10)}\``,
+                  `**Code SHA:** \`${(process.env.CODE_SHA || 'unknown').slice(0, 10)}\``,
+                  `**Branch:** \`${context.ref}\``,
+                  `**Run #:** ${context.runNumber}`,
+                ].join(' | ');
+                const bodyLines = [
+                  headerLine,
+                  ``,
+                  `**Run:** ${runUrl}`,
+                  ``,
+                  `**Failed step(s):**`,
+                  ...failedLines,
+                  ``,
+                  `> Tracking issue — auto-closed on the next successful cron run.`,
+                  `> See \`OPERATIONS.md\` for runbook (local re-run, debug tips).`,
+                ];
+                try {
+                  await github.rest.issues.create({
+                    alertOwner,
+                    alertRepo,
+                    title: `Daily cron refresh failed (${today})`,
+                    body: bodyLines.join('\n'),
+                    labels: ['cron-failed'],
+                  });
+                  core.info(`Created new cron-failed tracking issue for ${today} (${failedSteps.length} failed step(s)).`);
+                } catch (e) {
+                  if (e.status === 422 && /Label/i.test(e.message || '')) {
+                    core.info(`Label 'cron-failed' did not exist — creating it, then retrying the issue create.`);
+                    await github.rest.issues.createLabel({
+                      alertOwner, alertRepo, name: 'cron-failed',
+                      color: 'd73a4a',  // red, matches GitHub's default "bug" label color
+                      description: 'Auto-created by the cron-failure alert step',
+                    });
+                    await github.rest.issues.create({
+                      alertOwner,
+                      alertRepo,
+                      title: `Daily cron refresh failed (${today})`,
+                      body: bodyLines.join('\n'),
+                      labels: ['cron-failed'],
+                    });
+                    core.info(`Created 'cron-failed' label + tracking issue for ${today}.`);
+                  } else {
+                    throw e;
+                  }
+                }
+              } else {
+                // Open tracking issue already exists → append a comment so the
+                // issue accumulates failure history (date + run URL + steps
+                // + the same triage header for the new failure).
+                const issue = existing[0];
+                const headerLine = [
+                  `**Trigger:** \`${context.eventName}\``,
+                  `**Runner repo commit:** \`${context.sha.slice(0, 10)}\``,
+                  `**Code SHA:** \`${(process.env.CODE_SHA || 'unknown').slice(0, 10)}\``,
+                  `**Branch:** \`${context.ref}\``,
+                  `**Run #:** ${context.runNumber}`,
+                ].join(' | ');
+                await github.rest.issues.createComment({
+                  alertOwner,
+                  alertRepo,
+                  issue_number: issue.number,
+                  body: [
+                    `**Another failure — ${today}**`,
+                    ``,
+                    headerLine,
+                    ``,
+                    `**Run:** ${runUrl}`,
+                    ``,
+                    `**Failed step(s):**`,
+                    ...failedLines,
+                  ].join('\n'),
+                });
+                core.info(`Appended failure comment to cron-failed issue #${issue.number}.`);
+              }
+            } else if (isCancelled) {
+              // CANCELLED: preserve the existing tracking issue unchanged.
+              // A cancelled run is NOT a recovery — closing an active tracking
+              // issue here would hide a real ongoing outage.
+              core.info(`Refresh run was cancelled — leaving ${existing.length} open cron-failed issue(s) unchanged.`);
+            } else {
+              // SUCCESS (job has no failed steps at alert time): close
+              // cron-failed tracking issues (recovery). The turso-quota
+              // lifecycle above already ran, independently of failures.
+              // --- cron-failed recovery (only for a fully clean run) ---
+              if (isSuccess) {
+                for (const issue of existing) {
+                  await github.rest.issues.createComment({
+                    alertOwner,
+                    alertRepo,
+                    issue_number: issue.number,
+                    body: `Resolved by run ${runUrl}`,
+                  });
+                  await github.rest.issues.update({
+                    alertOwner,
+                    alertRepo,
+                    issue_number: issue.number,
+                    state: 'closed',
+                  });
+                  core.info(`Closed cron-failed issue #${issue.number} (resolved by ${runUrl}).`);
+                }
+                if (existing.length === 0) {
+                  core.info('Refresh succeeded and no open cron-failed issue to close.');
+                }
+              }
+            }
