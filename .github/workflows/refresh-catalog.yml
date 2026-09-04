@@ -665,7 +665,10 @@ jobs:
         if: always()
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # GH_PAT (not GITHUB_TOKEN): tracking issues live in the PRIVATE
+          # beulahkemp/RH-workflow repo, which this runner repo's default
+          # token cannot touch — every issues.* call would 404.
+          github-token: ${{ secrets.GH_PAT }}
           script: |
             const owner = context.repo.owner;   // the RUNNER repo (jobs/logs live here)
             const repo = context.repo.repo;
