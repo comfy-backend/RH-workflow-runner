@@ -816,8 +816,8 @@ jobs:
                 // with an unknown label 422s, same pattern as cron-failed).
                 try {
                   await github.rest.issues.create({
-                    alertOwner,
-                    alertRepo,
+                    owner: alertOwner,
+                    repo: alertRepo,
                     title: 'Turso replica stale — free-plan write quota exhausted',
                     body: quotaBody,
                     labels: ['turso-quota'],
@@ -826,13 +826,13 @@ jobs:
                 } catch (e) {
                   if (e.status === 422 && /Label/i.test(e.message || '')) {
                     await github.rest.issues.createLabel({
-                      alertOwner, alertRepo, name: 'turso-quota',
+                      owner: alertOwner, repo: alertRepo, name: 'turso-quota',
                       color: 'fbca04', // yellow: expected/known condition, not an outage
                       description: 'Turso free-plan write quota exhausted — replica stale, self-heals monthly',
                     });
                     await github.rest.issues.create({
-                      alertOwner,
-                      alertRepo,
+                      owner: alertOwner,
+                      repo: alertRepo,
                       title: 'Turso replica stale — free-plan write quota exhausted',
                       body: quotaBody,
                       labels: ['turso-quota'],
@@ -849,8 +849,8 @@ jobs:
                 const lastTouched = (issue.updated_at || '').slice(0, 10);
                 if (lastTouched !== today) {
                   await github.rest.issues.createComment({
-                    alertOwner,
-                    alertRepo,
+                    owner: alertOwner,
+                    repo: alertRepo,
                     issue_number: issue.number,
                     body: `Still quota-blocked — replica remains stale (expected). Run ${runUrl}`,
                   });
@@ -864,14 +864,14 @@ jobs:
               // failure) → close the tracking issues.
               for (const issue of quotaIssues) {
                 await github.rest.issues.createComment({
-                  alertOwner,
-                  alertRepo,
+                  owner: alertOwner,
+                  repo: alertRepo,
                   issue_number: issue.number,
                   body: `Quota window has ended — Turso writes are available again; the replica re-synced with run ${runUrl}`,
                 });
                 await github.rest.issues.update({
-                  alertOwner,
-                  alertRepo,
+                  owner: alertOwner,
+                  repo: alertRepo,
                   issue_number: issue.number,
                   state: 'closed',
                 });
@@ -917,8 +917,8 @@ jobs:
                 ];
                 try {
                   await github.rest.issues.create({
-                    alertOwner,
-                    alertRepo,
+                    owner: alertOwner,
+                    repo: alertRepo,
                     title: `Daily cron refresh failed (${today})`,
                     body: bodyLines.join('\n'),
                     labels: ['cron-failed'],
@@ -928,13 +928,13 @@ jobs:
                   if (e.status === 422 && /Label/i.test(e.message || '')) {
                     core.info(`Label 'cron-failed' did not exist — creating it, then retrying the issue create.`);
                     await github.rest.issues.createLabel({
-                      alertOwner, alertRepo, name: 'cron-failed',
+                      owner: alertOwner, repo: alertRepo, name: 'cron-failed',
                       color: 'd73a4a',  // red, matches GitHub's default "bug" label color
                       description: 'Auto-created by the cron-failure alert step',
                     });
                     await github.rest.issues.create({
-                      alertOwner,
-                      alertRepo,
+                      owner: alertOwner,
+                      repo: alertRepo,
                       title: `Daily cron refresh failed (${today})`,
                       body: bodyLines.join('\n'),
                       labels: ['cron-failed'],
@@ -945,10 +945,15 @@ jobs:
                   }
                 }
               } else {
-                // Open tracking issue already exists → append a comment so the
-                // issue accumulates failure history (date + run URL + steps
-                // + the same triage header for the new failure).
-                const issue = existing[0];
+                // Open tracking issue(s) already exist → append a comment so
+                // each issue accumulates failure history (date + run URL +
+                // steps + the same triage header for the new failure).
+                // ALL open cron-failed issues get the comment: the recovery
+                // path below closes all of them, and a single first-listed
+                // target would route the signal to whichever issue happens
+                // to sort first (newest-first listing sent it to the WRONG
+                // tracker when #6 and #13 were both open, 2026-09-04).
+                for (const issue of existing) {
                 const headerLine = [
                   `**Trigger:** \`${context.eventName}\``,
                   `**Runner repo commit:** \`${context.sha.slice(0, 10)}\``,
@@ -957,8 +962,8 @@ jobs:
                   `**Run #:** ${context.runNumber}`,
                 ].join(' | ');
                 await github.rest.issues.createComment({
-                  alertOwner,
-                  alertRepo,
+                  owner: alertOwner,
+                  repo: alertRepo,
                   issue_number: issue.number,
                   body: [
                     `**Another failure — ${today}**`,
@@ -972,6 +977,7 @@ jobs:
                   ].join('\n'),
                 });
                 core.info(`Appended failure comment to cron-failed issue #${issue.number}.`);
+                }
               }
             } else if (isCancelled) {
               // CANCELLED: preserve the existing tracking issue unchanged.
@@ -986,14 +992,14 @@ jobs:
               if (isSuccess) {
                 for (const issue of existing) {
                   await github.rest.issues.createComment({
-                    alertOwner,
-                    alertRepo,
+                    owner: alertOwner,
+                    repo: alertRepo,
                     issue_number: issue.number,
                     body: `Resolved by run ${runUrl}`,
                   });
                   await github.rest.issues.update({
-                    alertOwner,
-                    alertRepo,
+                    owner: alertOwner,
+                    repo: alertRepo,
                     issue_number: issue.number,
                     state: 'closed',
                   });
