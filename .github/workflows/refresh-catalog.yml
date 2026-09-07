@@ -482,13 +482,11 @@ jobs:
             git -C "$RH_DATA_REPO" remote set-url origin "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git"
           fi
           git -C "$RH_DATA_REPO" lfs install || true
-          # Make sure the LFS working copy of the DB carrier is present
-          # (purely defensive: the sync compares HEAD pointers and writes the
-          # fresh .gz from data/catalog.db regardless; the restore step may
-          # have trimmed the working copy).
-          if [ ! -s "$RH_DATA_REPO/catalog.db.gz" ]; then
-            git -C "$RH_DATA_REPO" lfs pull --include="catalog.db.gz" || true
-          fi
+          # NOTE (session-8 coverage audit): no LFS pull here on purpose —
+          # the sync compares HEAD POINTERS (git cat-file, no working copy
+          # needed) and writes the fresh .gz from data/catalog.db. Pulling
+          # the ~350MB object just to overwrite it wasted ~10.5GB/mo of LFS
+          # bandwidth.
           python3 scripts/chunked_data_sync.py --chunk-size 5000 --data-repo "$RH_DATA_REPO"
 
       - name: Free data-repo clone before cache save
