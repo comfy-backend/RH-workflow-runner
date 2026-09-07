@@ -199,11 +199,26 @@ jobs:
             cd "$RH_DATA_REPO"
             # git-lfs ships preinstalled on ubuntu-latest runners
             git lfs install
-            git lfs pull --include="catalog.db"
-            # Verify we got the real DB, not a ~130-byte LFS pointer file.
-            if [ "$(stat -c%s catalog.db)" -lt 1000000 ]; then
-              echo "FATAL: catalog.db is still an LFS pointer after pull — aborting"
-              exit 1
+            # v5 carrier: the DB ships gzip-compressed (catalog.db.gz, ~6x
+            # smaller — the raw DB crossed GitHub LFS's 2 GiB per-object cap
+            # on 2026-09-06 and every DB push 422'd). The raw catalog.db is
+            # the legacy carrier; this feature-detects so pre-cutover clone
+            # states still restore.
+            git lfs pull --include="catalog.db.gz" || true
+            if [ -s catalog.db.gz ] && [ "$(stat -c%s catalog.db.gz)" -gt 1000 ]; then
+              gunzip -c catalog.db.gz > catalog.db
+              if [ "$(stat -c%s catalog.db)" -lt 1000000 ]; then
+                echo "FATAL: gunzipped catalog.db is too small — aborting"
+                exit 1
+              fi
+              echo "Restored catalog.db from catalog.db.gz ($(stat -c%s catalog.db.gz) -> $(stat -c%s catalog.db) bytes)"
+            else
+              git lfs pull --include="catalog.db"
+              # Verify we got the real DB, not a ~130-byte LFS pointer file.
+              if [ "$(stat -c%s catalog.db)" -lt 1000000 ]; then
+                echo "FATAL: catalog.db is still an LFS pointer after pull — aborting"
+                exit 1
+              fi
             fi
             cd -
             cp "$RH_DATA_REPO/catalog.db" data/catalog.db
@@ -217,7 +232,7 @@ jobs:
             fi
             # The data-repo working copies are redundant now (Phase 8 compares
             # against HEAD blobs and re-copies from data/ on change) — free ~5.6GB.
-            rm -rf "$RH_DATA_REPO/exports" "$RH_DATA_REPO/catalog.db"
+            rm -rf "$RH_DATA_REPO/exports" "$RH_DATA_REPO/catalog.db" "$RH_DATA_REPO/catalog.db.gz"
             df -h / | tail -1
           else
             echo "Cache hit — DB present ($(stat -c%s data/catalog.db) bytes)"
@@ -462,10 +477,12 @@ jobs:
             git -C "$RH_DATA_REPO" remote set-url origin "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git"
           fi
           git -C "$RH_DATA_REPO" lfs install || true
-          # Make sure the LFS working copy of catalog.db is present (restore
-          # step may have skipped LFS pull on cache-hit runs).
-          if [ ! -s "$RH_DATA_REPO/catalog.db" ] || [ "$(stat -c%s "$RH_DATA_REPO/catalog.db")" -lt 1000000 ]; then
-            git -C "$RH_DATA_REPO" lfs pull --include="catalog.db" || true
+          # Make sure the LFS working copy of the DB carrier is present
+          # (purely defensive: the sync compares HEAD pointers and writes the
+          # fresh .gz from data/catalog.db regardless; the restore step may
+          # have trimmed the working copy).
+          if [ ! -s "$RH_DATA_REPO/catalog.db.gz" ]; then
+            git -C "$RH_DATA_REPO" lfs pull --include="catalog.db.gz" || true
           fi
           python3 scripts/chunked_data_sync.py --chunk-size 5000 --data-repo "$RH_DATA_REPO"
 
