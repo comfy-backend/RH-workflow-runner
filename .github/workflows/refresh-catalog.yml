@@ -207,7 +207,8 @@ jobs:
             git lfs pull --include="catalog.db.gz" || true
             if [ -s catalog.db.gz ] && [ "$(stat -c%s catalog.db.gz)" -gt 1000 ]; then
               gunzip -c catalog.db.gz > catalog.db
-              if [ "$(stat -c%s catalog.db)" -lt 1000000 ]; then
+              gz_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
+              if [ "$gz_sz" -lt 1000000 ]; then
                 echo "FATAL: gunzipped catalog.db is too small — aborting"
                 exit 1
               fi
@@ -215,8 +216,12 @@ jobs:
             else
               git lfs pull --include="catalog.db"
               # Verify we got the real DB, not a ~130-byte LFS pointer file.
-              if [ "$(stat -c%s catalog.db)" -lt 1000000 ]; then
-                echo "FATAL: catalog.db is still an LFS pointer after pull — aborting"
+              # stat on a MISSING file yields "" (bash: integer expression
+              # expected) which reads as false — guard against that dead
+              # branch: an absent carrier must still abort loudly here.
+              legacy_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
+              if [ "$legacy_sz" -lt 1000000 ]; then
+                echo "FATAL: catalog.db missing or still an LFS pointer after pull — aborting"
                 exit 1
               fi
             fi
