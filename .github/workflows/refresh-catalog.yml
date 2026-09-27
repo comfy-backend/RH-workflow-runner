@@ -188,6 +188,8 @@ jobs:
       - name: Restore DB from data repo (if cache missed)
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
+          TURSO_DB_TOKEN: ${{ secrets.TURSO_DB_TOKEN }}
         run: |
           if [ ! -f data/catalog.db ] || [ "$(stat -c%s data/catalog.db)" -lt 1000000 ]; then
             echo "Cache missed — restoring from data repo"
@@ -195,38 +197,72 @@ jobs:
               echo "GH_PAT not set and cache missed — starting from an EMPTY DB (full re-crawl)"
               exit 0
             fi
+            # LFS smudge OFF for this clone (2026-09-27): the LFS budget
+            # block (issue #18) rejects READS too since Sep 25 — a smudged
+            # checkout aborts the clone with exit 128 and kills the run
+            # (the Sep 25/26 outages). The shards are plain git (unaffected);
+            # the legacy carrier is pulled EXPLICITLY below, only when no
+            # shard manifest exists (pre-cutover clones).
+            export GIT_LFS_SKIP_SMUDGE=1
             git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"
-            cd "$RH_DATA_REPO"
-            # git-lfs ships preinstalled on ubuntu-latest runners
-            git lfs install
-            # v5 carrier: the DB ships gzip-compressed (catalog.db.gz, ~6x
-            # smaller — the raw DB crossed GitHub LFS's 2 GiB per-object cap
-            # on 2026-09-06 and every DB push 422'd). The raw catalog.db is
-            # the legacy carrier; this feature-detects so pre-cutover clone
-            # states still restore.
-            git lfs pull --include="catalog.db.gz" || true
-            if [ -s catalog.db.gz ] && [ "$(stat -c%s catalog.db.gz)" -gt 1000 ]; then
-              gunzip -c catalog.db.gz > catalog.db
-              gz_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
-              if [ "$gz_sz" -lt 1000000 ]; then
-                echo "FATAL: gunzipped catalog.db is too small — aborting"
-                exit 1
-              fi
-              echo "Restored catalog.db from catalog.db.gz ($(stat -c%s catalog.db.gz) -> $(stat -c%s catalog.db) bytes)"
+            git -C "$RH_DATA_REPO" lfs install
+            restored=0
+            if [ -f "$RH_DATA_REPO/shards/MANIFEST.json" ]; then
+              # T1 M2 (2026-09-27): the plain-git shard tree is the PRIMARY
+              # DB carrier. The CLI asserts manifest/shard integrity and
+              # exits nonzero on any mismatch (loud, never a partial DB).
+              python3 -m rh_catalog.cli shards-restore --data-repo "$RH_DATA_REPO" --out data/catalog.db
+              restored=1
             else
-              git lfs pull --include="catalog.db"
-              # Verify we got the real DB, not a ~130-byte LFS pointer file.
-              # stat on a MISSING file yields "" (bash: integer expression
-              # expected) which reads as false — guard against that dead
-              # branch: an absent carrier must still abort loudly here.
-              legacy_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
-              if [ "$legacy_sz" -lt 1000000 ]; then
-                echo "FATAL: catalog.db missing or still an LFS pointer after pull — aborting"
-                exit 1
+              echo "No shard manifest — trying the legacy catalog.db.gz carrier"
+              cd "$RH_DATA_REPO"
+              # v5 carrier: the DB ships gzip-compressed (catalog.db.gz, ~6x
+              # smaller — the raw DB crossed GitHub LFS's 2 GiB per-object cap
+              # on 2026-09-06 and every DB push 422'd). The raw catalog.db is
+              # the legacy carrier; this feature-detects so pre-cutover clone
+              # states still restore.
+              git lfs pull --include="catalog.db.gz" || true
+              if [ -s catalog.db.gz ] && [ "$(stat -c%s catalog.db.gz)" -gt 1000 ]; then
+                gunzip -c catalog.db.gz > catalog.db
+                gz_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
+                if [ "$gz_sz" -lt 1000000 ]; then
+                  echo "FATAL: gunzipped catalog.db is too small — aborting"
+                  exit 1
+                fi
+                echo "Restored catalog.db from catalog.db.gz ($(stat -c%s catalog.db.gz) -> $(stat -c%s catalog.db) bytes)"
+                cp catalog.db "$GITHUB_WORKSPACE/data/catalog.db"
+                restored=1
+              else
+                git lfs pull --include="catalog.db"
+                # Verify we got the real DB, not a ~130-byte LFS pointer file.
+                # stat on a MISSING file yields "" (bash: integer expression
+                # expected) which reads as false — an absent/pointer carrier
+                # falls through to the Turso heal below (NOT a hard abort:
+                # the 2026-09 LFS-budget outage showed a dead carrier must
+                # degrade to the next rung, not kill the run).
+                legacy_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
+                if [ "$legacy_sz" -lt 1000000 ]; then
+                  echo "Legacy carriers unusable (LFS budget-blocked or absent)"
+                else
+                  cp catalog.db "$GITHUB_WORKSPACE/data/catalog.db"
+                  restored=1
+                fi
+              fi
+              cd -
+            fi
+            if [ "$restored" -eq 0 ]; then
+              # Heal ladder (2026-09-27): no shards + no usable LFS carrier.
+              # Turso carries the workflow-side tables (no rh_app — the
+              # missing-driven crawl re-walks it; see restore_from_turso).
+              if [ -n "$TURSO_DB_URL" ] && [ -n "$TURSO_DB_TOKEN" ]; then
+                echo "No usable DB carrier in the data repo — restoring the workflow side from Turso"
+                if ! python3 -m rh_catalog.cli restore-turso --out data/catalog.db; then
+                  echo "::warning::Turso restore failed — starting from an EMPTY DB (full re-crawl)"
+                fi
+              else
+                echo "::warning::No DB carrier available (no shards, LFS budget-blocked, no Turso creds) — starting from an EMPTY DB (full re-crawl)"
               fi
             fi
-            cd -
-            cp "$RH_DATA_REPO/catalog.db" data/catalog.db
             # Restore export files from the data repo working tree. The data
             # repo stores them SHARDED (exports/20/<id>.json) but the pipeline
             # uses FLAT paths (data/exports/<id>.json) — flatten while copying.
@@ -236,7 +272,8 @@ jobs:
               echo "Restored $(find data/exports -name '*.comfyui.json' | wc -l) export files from data repo"
             fi
             # The data-repo working copies are redundant now (Phase 8 compares
-            # against HEAD blobs and re-copies from data/ on change) — free ~5.6GB.
+            # against HEAD blobs and re-copies from data/ on change) — free
+            # ~5.6GB. The shards/ tree STAYS: Phase 8's split rebuilds into it.
             rm -rf "$RH_DATA_REPO/exports" "$RH_DATA_REPO/catalog.db" "$RH_DATA_REPO/catalog.db.gz"
             df -h / | tail -1
           else
@@ -476,6 +513,12 @@ jobs:
             exit 0
           fi
           # Reuse the clone from the restore step when present; else fresh clone.
+          # Smudge OFF here too (2026-09-27): a cache-hit day takes this fresh
+          # clone path — a smudged checkout would die on the budget-blocked LFS
+          # reads (issue #18) exactly like the restore step did on Sep 25/26.
+          # The sync compares HEAD POINTERS and writes the fresh .gz from
+          # data/catalog.db, so the pointer-file working copy is fine.
+          export GIT_LFS_SKIP_SMUDGE=1
           if [ ! -d "$RH_DATA_REPO/.git" ]; then
             git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"
           else
