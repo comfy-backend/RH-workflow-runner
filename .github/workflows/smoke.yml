@@ -45,9 +45,20 @@ jobs:
             echo "FATAL: GH_PAT secret not set"; exit 1
           fi
           rm -rf /tmp/rh-data-smoke
+          # Smudge OFF: the LFS budget block (issue #18) rejects READS too
+          # since 2026-09-25 — a smudged checkout dies with exit 128 (this
+          # exact crash broke the smoke on Sep 25+ pushes). The pointer
+          # stubs prove clone+tree access, which is all this step tests.
+          export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" /tmp/rh-data-smoke
-          # The LFS pointer file (not the 1.5GB object) is enough to prove access.
-          test -s /tmp/rh-data-smoke/catalog.db && echo "Data repo clone OK (LFS pointer present)"
+          # The LFS pointer file (not the object) is enough to prove access.
+          test -s /tmp/rh-data-smoke/catalog.db.gz && echo "Data repo clone OK (v5 carrier pointer present)"
+          # The T1 M2 shard carrier is plain git — a full-fidelity marker.
+          if [ -f /tmp/rh-data-smoke/shards/MANIFEST.json ]; then
+            echo "Shard carrier present: $(python3 -c "import json;m=json.load(open('/tmp/rh-data-smoke/shards/MANIFEST.json'));print(m.get('format','?'), 'v'+str(m.get('version','?')))")"
+          else
+            echo "note: no shards/MANIFEST.json yet (pre-M2-cutover HEAD)"
+          fi
           git -C /tmp/rh-data-smoke log --oneline -1
           rm -rf /tmp/rh-data-smoke
 
