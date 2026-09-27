@@ -209,10 +209,17 @@ jobs:
             restored=0
             if [ -f "$RH_DATA_REPO/shards/MANIFEST.json" ]; then
               # T1 M2 (2026-09-27): the plain-git shard tree is the PRIMARY
-              # DB carrier. The CLI asserts manifest/shard integrity and
-              # exits nonzero on any mismatch (loud, never a partial DB).
-              python3 -m rh_catalog.cli shards-restore --data-repo "$RH_DATA_REPO" --out data/catalog.db
-              restored=1
+              # DB carrier. The CLI asserts manifest/shard integrity (sha256
+              # per shard, pinned columns, row-count equality) and exits
+              # nonzero on ANY mismatch. Round-2 audit F3: a corrupt shard
+              # DEGRADES to the next rung (Turso / empty-DB bootstrap) —
+              # the ladder doctrine applies to the primary rung too, not
+              # just the legacy carrier. A ::warning:: makes it visible.
+              if python3 -m rh_catalog.cli shards-restore --data-repo "$RH_DATA_REPO" --out data/catalog.db; then
+                restored=1
+              else
+                echo "::warning::shards-restore failed (corrupt/torn tree?) — falling through the ladder"
+              fi
             else
               echo "No shard manifest — trying the legacy catalog.db.gz carrier"
               cd "$RH_DATA_REPO"
