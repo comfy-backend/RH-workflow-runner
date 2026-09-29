@@ -51,14 +51,15 @@ jobs:
           # stubs prove clone+tree access, which is all this step tests.
           export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" /tmp/rh-data-smoke
-          # The LFS pointer file (not the object) is enough to prove access.
-          test -s /tmp/rh-data-smoke/catalog.db.gz && echo "Data repo clone OK (v5 carrier pointer present)"
-          # The T1 M2 shard carrier is plain git — a full-fidelity marker.
-          if [ -f /tmp/rh-data-smoke/shards/MANIFEST.json ]; then
-            echo "Shard carrier present: $(python3 -c "import json;m=json.load(open('/tmp/rh-data-smoke/shards/MANIFEST.json'));print(m.get('format','?'), 'v'+str(m.get('version','?')))")"
-          else
-            echo "note: no shards/MANIFEST.json yet (pre-M2-cutover HEAD)"
-          fi
+          # T1 M3 (2026-09-29): the catalog.db.gz pointer is RETIRED from
+          # the tree (out-of-band cutover dc52ed3) — the HARD assertion is
+          # now the shard carrier (round-3 audit R3-B F1: the old pointer
+          # check became silently-false-forever, swallowed by &&; a soft
+          # note is not a smoke test).
+          test -f /tmp/rh-data-smoke/shards/MANIFEST.json || \
+            { echo "FATAL: shards/MANIFEST.json missing from the data repo HEAD"; exit 1; }
+          echo "Shard carrier present: $(python3 -c "import json;m=json.load(open('/tmp/rh-data-smoke/shards/MANIFEST.json'));print(m.get('format','?'), 'v'+str(m.get('version','?')))")"
+          echo "Data repo clone OK"
           git -C /tmp/rh-data-smoke log --oneline -1
           rm -rf /tmp/rh-data-smoke
 

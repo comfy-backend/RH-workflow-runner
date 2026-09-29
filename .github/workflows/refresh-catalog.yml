@@ -954,6 +954,114 @@ jobs:
             }
 
             // End of turso-quota lifecycle.
+
+            // ----------------------------------------------------------------
+            // gitlab-quota issue lifecycle (2026-09-29, round-3 audit R3-B
+            // F2) — the mirror-image of turso-quota for the DATA-repo
+            // GitLab mirror (issue #6's storage-quota condition). Since
+            // quota-blocked data pushes are warning-classified now
+            // (chunked_data_sync writes DATA_PUSH_QUOTA_REMOTES instead of
+            // DATA_PUSH_FAILED), a quota-only day is a GREEN run with no
+            // cron-failure signal — this lifecycle is what keeps the
+            // mirror's staleness VISIBLE (the alert layer's founding
+            // purpose: the silently-green GitLab mirror of 2026-09-01..02).
+            // Evidence rules mirror turso: a run with NO quota-blocked
+            // remote and NO unexpected push failure closes the tracking
+            // issue (the mirror advanced); an unexpected push failure
+            // leaves it open (state unknown); cancelled runs preserve.
+            // ----------------------------------------------------------------
+            const glQuotaRemotes = (process.env.DATA_PUSH_QUOTA_REMOTES || '').trim();
+            const { data: glQuotaOpen } = await github.rest.issues.listForRepo({
+              owner: alertOwner,
+              repo: alertRepo,
+              state: 'open',
+              labels: 'gitlab-quota',
+              per_page: 100,
+            });
+            const glQuotaIssues = glQuotaOpen.filter(i => !i.pull_request);
+
+            if (glQuotaRemotes) {
+              const glBody = [
+                'The GitLab data-repo mirror cannot accept pushes: the project storage quota is exceeded (issue #6).',
+                '',
+                '**Status:** the primary data carrier (GitHub data repo — plain-git shards since T1 M3) is UNAFFECTED; only the redundant GitLab mirror is stale.',
+                '',
+                '**Heal:** owner action required (raise the project storage quota / slim the mirror / drop it). Once pushes advance again, this issue auto-closes on the first clean run.',
+                '',
+                `Blocked remote(s): \`${glQuotaRemotes}\``,
+                `First observed this window: run ${runUrl}`,
+                '',
+                '> Tracking issue — auto-closed by the first run whose data pushes all advance.',
+                '> A `cron-failed` red run is NOT expected for this condition (quota-only days are green by design).',
+              ].join('\n');
+              if (glQuotaIssues.length === 0) {
+                try {
+                  await github.rest.issues.create({
+                    owner: alertOwner,
+                    repo: alertRepo,
+                    title: 'GitLab data-mirror stale — project storage quota exceeded',
+                    body: glBody,
+                    labels: ['gitlab-quota'],
+                  });
+                  core.info('Created gitlab-quota tracking issue.');
+                } catch (e) {
+                  if (e.status === 422 && /Label/i.test(e.message || '')) {
+                    await github.rest.issues.createLabel({
+                      owner: alertOwner, repo: alertRepo, name: 'gitlab-quota',
+                      color: 'fbca04', // yellow: expected/known condition, not an outage
+                      description: 'GitLab data-mirror storage quota exceeded — mirror stale until owner action',
+                    });
+                    await github.rest.issues.create({
+                      owner: alertOwner,
+                      repo: alertRepo,
+                      title: 'GitLab data-mirror stale — project storage quota exceeded',
+                      body: glBody,
+                      labels: ['gitlab-quota'],
+                    });
+                    core.info('Created gitlab-quota label + tracking issue.');
+                  } else {
+                    throw e;
+                  }
+                }
+              } else {
+                // Daily liveness comment (deduped per UTC day).
+                const issue = glQuotaIssues[0];
+                const lastTouched = (issue.updated_at || '').slice(0, 10);
+                if (lastTouched !== today) {
+                  await github.rest.issues.createComment({
+                    owner: alertOwner,
+                    repo: alertRepo,
+                    issue_number: issue.number,
+                    body: `Mirror still quota-blocked (expected until owner action). Run ${runUrl}`,
+                  });
+                  core.info(`Appended daily comment to gitlab-quota issue #${issue.number}.`);
+                } else {
+                  core.info(`gitlab-quota issue #${issue.number} already updated today — skipping comment.`);
+                }
+              }
+            } else if (glQuotaIssues.length > 0 && process.env.DATA_PUSH_FAILED !== 'true') {
+              // No quota-blocked remote + no unexpected push failure —
+              // the mirror advanced (or was never blocked) -> close.
+              for (const issue of glQuotaIssues) {
+                await github.rest.issues.createComment({
+                  owner: alertOwner,
+                  repo: alertRepo,
+                  issue_number: issue.number,
+                  body: `Data pushes advanced with run ${runUrl} — the GitLab mirror is no longer quota-blocked.`,
+                });
+                await github.rest.issues.update({
+                  owner: alertOwner,
+                  repo: alertRepo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                });
+                core.info(`Closed gitlab-quota issue #${issue.number} (pushes advanced by ${runUrl}).`);
+              }
+            } else if (glQuotaIssues.length > 0) {
+              core.info('Data-repo pushes failed UNEXPECTEDLY this cycle — mirror state unknown; leaving gitlab-quota issue(s) open unchanged.');
+            }
+
+            // End of gitlab-quota lifecycle.
             }
 
             if (isFailure) {
