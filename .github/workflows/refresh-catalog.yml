@@ -190,6 +190,8 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
           TURSO_DB_TOKEN: ${{ secrets.TURSO_DB_TOKEN }}
+          NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
+          NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
         run: |
           if [ ! -f data/catalog.db ] || [ "$(stat -c%s data/catalog.db)" -lt 1000000 ]; then
             echo "Cache missed — restoring from data repo"
@@ -204,10 +206,28 @@ jobs:
             # the legacy carrier is pulled EXPLICITLY below, only when no
             # shard manifest exists (pre-cutover clones).
             export GIT_LFS_SKIP_SMUDGE=1
-            git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"
-            git -C "$RH_DATA_REPO" lfs install
+            # Ladder rung 1 (T6, 2026-09-29): the origin clone. On a
+            # repo-level GH incident (repo deleted/renamed, PAT scoped out,
+            # repo-level outage) the clone FAILS — trap it and fall through
+            # to the Netlify blob rung (full-fidelity third copy, an
+            # independent failure domain) instead of letting bash -e kill
+            # the step. Account-level GH loss = the runner itself is dead;
+            # DR then is the manual CLI (rh_catalog.cli blobs-restore with
+            # the PAT from HANDOFF), not this rung.
+            if ! git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"; then
+              echo "::warning::origin clone failed — trying the Netlify blob restore rung (T6)"
+              if [ -n "$NETLIFY_PAT" ] && [ -n "$NETLIFY_BLOB_SITE_ID" ]; then
+                if ! python3 -m rh_catalog.cli blobs-restore --out "$RH_DATA_REPO"; then
+                  echo "::warning::Netlify blob restore failed — falling through the ladder"
+                  rm -rf "$RH_DATA_REPO"
+                fi
+              else
+                echo "::warning::NETLIFY secrets unset — the blob restore rung is unavailable"
+              fi
+            fi
+            git -C "$RH_DATA_REPO" lfs install || true
             restored=0
-            if [ -f "$RH_DATA_REPO/shards/MANIFEST.json" ]; then
+            if [ -d "$RH_DATA_REPO/.git" ] && [ -f "$RH_DATA_REPO/shards/MANIFEST.json" ]; then
               # T1 M2 (2026-09-27): the plain-git shard tree is the PRIMARY
               # DB carrier. The CLI asserts manifest/shard integrity (sha256
               # per shard, pinned columns, row-count equality) and exits
@@ -220,42 +240,15 @@ jobs:
               else
                 echo "::warning::shards-restore failed (corrupt/torn tree?) — falling through the ladder"
               fi
-            else
-              echo "No shard manifest — trying the legacy catalog.db.gz carrier"
-              cd "$RH_DATA_REPO"
-              # v5 carrier: the DB ships gzip-compressed (catalog.db.gz, ~6x
-              # smaller — the raw DB crossed GitHub LFS's 2 GiB per-object cap
-              # on 2026-09-06 and every DB push 422'd). The raw catalog.db is
-              # the legacy carrier; this feature-detects so pre-cutover clone
-              # states still restore.
-              git lfs pull --include="catalog.db.gz" || true
-              if [ -s catalog.db.gz ] && [ "$(stat -c%s catalog.db.gz)" -gt 1000 ]; then
-                gunzip -c catalog.db.gz > catalog.db
-                gz_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
-                if [ "$gz_sz" -lt 1000000 ]; then
-                  echo "FATAL: gunzipped catalog.db is too small — aborting"
-                  exit 1
-                fi
-                echo "Restored catalog.db from catalog.db.gz ($(stat -c%s catalog.db.gz) -> $(stat -c%s catalog.db) bytes)"
-                cp catalog.db "$GITHUB_WORKSPACE/data/catalog.db"
-                restored=1
-              else
-                git lfs pull --include="catalog.db"
-                # Verify we got the real DB, not a ~130-byte LFS pointer file.
-                # stat on a MISSING file yields "" (bash: integer expression
-                # expected) which reads as false — an absent/pointer carrier
-                # falls through to the Turso heal below (NOT a hard abort:
-                # the 2026-09 LFS-budget outage showed a dead carrier must
-                # degrade to the next rung, not kill the run).
-                legacy_sz=$(stat -c%s catalog.db 2>/dev/null || echo 0)
-                if [ "$legacy_sz" -lt 1000000 ]; then
-                  echo "Legacy carriers unusable (LFS budget-blocked or absent)"
-                else
-                  cp catalog.db "$GITHUB_WORKSPACE/data/catalog.db"
-                  restored=1
-                fi
-              fi
-              cd -
+            elif [ -d "$RH_DATA_REPO/.git" ]; then
+              # M3 (2026-09-29) retired the legacy LFS carriers out-of-band
+              # (the catalog.db.gz pointer + both .gitattributes rules are
+              # gone from the tree; R4-C audit P3): every clone newer than
+              # 2026-09-27 ALWAYS carries the shard manifest, so a present
+              # repo without one is a pre-cutover tree — fall through (the
+              # old hard-abort + both `git lfs pull` sites died with the
+              # branch).
+              echo "::warning::data repo present but no shard manifest (pre-cutover tree?) — the legacy LFS carriers are retired; falling through the ladder"
             fi
             if [ "$restored" -eq 0 ]; then
               # Heal ladder (2026-09-27): no shards + no usable LFS carrier.
@@ -539,6 +532,31 @@ jobs:
           # bandwidth.
           python3 scripts/chunked_data_sync.py --chunk-size 5000 --data-repo "$RH_DATA_REPO"
 
+      - name: Phase 8.5 — Backup data repo to Netlify Blobs (bundle chain, T6)
+        env:
+          NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
+          NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
+          RH_DATA_REPO: ${{ env.RH_DATA_REPO }}
+        run: |
+          # T6 (2026-09-29, owner directive): the THIRD data copy. GitHub
+          # origin is the sole live copy (the GitLab data mirror is
+          # quota-dead, issue #6); the Netlify blob store holds a git-bundle
+          # chain (seed + daily delta bundles, ~2.6 MB/day) restorable with
+          # standard git (blobs-restore). The CLI never fails this step in
+          # place — it writes NETLIFY_BACKUP_FAILED for the deferred-failure
+          # gate (a missing third copy is real signal, DATA_PUSH_FAILED
+          # semantics). Runs BEFORE "Free data-repo clone" (needs the clone).
+          if [ -z "$NETLIFY_PAT" ] || [ -z "$NETLIFY_BLOB_SITE_ID" ]; then
+            echo "::warning::NETLIFY secrets unset — the third-copy backup arm cannot run (misconfiguration, not a skip)"
+            echo "NETLIFY_BACKUP_FAILED=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # crash-class backstop: the CLI exports the marker itself on its
+          # own error paths; the wrapper only catches unhandled crashes.
+          if ! python3 -m rh_catalog.cli blobs-sync --data-repo "$RH_DATA_REPO"; then
+            echo "NETLIFY_BACKUP_FAILED=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Free data-repo clone before cache save
         run: |
           # The cache-save post step tars data/ (~6GB) — free the data-repo
@@ -686,7 +704,7 @@ jobs:
         # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
         # for a month) gets surfaced: chunked_data_sync.py exports
         # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
-        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true')
+        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true')
         run: |
           failed=0
           if [ "${TURSO_SYNC_FAILED:-false}" = "true" ]; then
@@ -703,6 +721,10 @@ jobs:
           fi
           if [ "${DATA_PUSH_FAILED:-false}" = "true" ]; then
             echo "::error::Data-repo pushes failed earlier in this run (Phase 8 — deferred, remotes: ${DATA_PUSH_FAILED_REMOTES:-unknown}). The local catalog.db/exports sync and all later backup steps completed, but the listed remote(s) may be STALE. A fast-forward-only push could not advance them (see the Phase 8 log for the exact reason: divergence / remote ahead / retries exhausted)."
+            failed=1
+          fi
+          if [ "${NETLIFY_BACKUP_FAILED:-false}" = "true" ]; then
+            echo "::error::Netlify blob backup failed earlier in this run (Phase 8.5 — deferred). The data-repo sync, commit+push, and GitLab mirror completed, but the THIRD copy (the Netlify blob bundle chain) did not advance. Check the Phase 8.5 log (store unseeded / wedge / transport errors); if the store is stale, re-seed via the blob-seed workflow_dispatch on this repo."
             failed=1
           fi
           if [ "${failed}" = "1" ]; then
@@ -799,6 +821,7 @@ jobs:
               process.env.MODELS_STEP_FAILED === 'true' ||
               process.env.APPS_CRAWL_FAILED === 'true' ||
               process.env.DATA_PUSH_FAILED === 'true' ||
+              process.env.NETLIFY_BACKUP_FAILED === 'true' ||
               process.env.DEFERRED_FAILURE_RAISED === 'true';
             // Failure signal: prior step(s) failed OR jobConclusion (post-run)
             // is 'failure' OR a deferred-failure flag is set. The first clause

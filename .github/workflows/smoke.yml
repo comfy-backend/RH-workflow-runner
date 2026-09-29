@@ -69,14 +69,49 @@ jobs:
           GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
           TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
           TURSO_DB_TOKEN: ${{ secrets.TURSO_DB_TOKEN }}
+          NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
+          NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
         run: |
           # Presence check only — values are never echoed (and would be
           # auto-redacted anyway).
           missing=0
-          for v in GH_PAT GITLAB_PAT TURSO_DB_URL TURSO_DB_TOKEN; do
+          for v in GH_PAT GITLAB_PAT TURSO_DB_URL TURSO_DB_TOKEN NETLIFY_PAT NETLIFY_BLOB_SITE_ID; do
             if [ -z "${!v}" ]; then echo "FATAL: secret $v is not set"; missing=1; fi
           done
-          [ "$missing" = "0" ] && echo "All 4 secrets present"
+          [ "$missing" = "0" ] && echo "All 6 secrets present"
+
+      - name: Netlify blob backup round-trip (T6 canary)
+        env:
+          NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
+          NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
+        run: |
+          # T6 (2026-09-29): the third-copy arm's LIVE canary. A tiny
+          # synthetic repo goes through the REAL production path —
+          # blobs-sync (bootstrap + one incremental edge) then
+          # blobs-restore — against the ISOLATED smoke store
+          # (site:rh-backup-smoke, never the production store). If the
+          # backup arm breaks (API drift, auth death, a code regression),
+          # smoke goes red on the next runner push — that is the point.
+          set -e
+          python3 -m pip install -q httpx
+          rm -rf /tmp/rh-blob-smoke && mkdir -p /tmp/rh-blob-smoke
+          cd /tmp/rh-blob-smoke
+          git init -q -b main tiny
+          git -C tiny config user.name t && git -C tiny config user.email t@t
+          echo one > tiny/a.txt && git -C tiny add -A && git -C tiny commit -qm c1
+          export NETLIFY_PAT NETLIFY_BLOB_SITE_ID
+          # bootstrap (tiny repo is non-shallow -> the real bootstrap path)
+          python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-blob-smoke/tiny --store site:rh-backup-smoke
+          echo two > tiny/b.txt && git -C tiny add -A && git -C tiny commit -qm c2
+          # incremental edge
+          python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-blob-smoke/tiny --store site:rh-backup-smoke
+          # restore + assert exact history
+          python3 -m rh_catalog.cli blobs-restore --out /tmp/rh-blob-smoke/restored --store site:rh-backup-smoke
+          test "$(git -C /tmp/rh-blob-smoke/tiny rev-parse HEAD)" = "$(git -C /tmp/rh-blob-smoke/restored rev-parse HEAD)" \
+            || { echo "FATAL: blob round-trip head mismatch"; exit 1; }
+          test "$(cat /tmp/rh-blob-smoke/restored/b.txt)" = "two" \
+            || { echo "FATAL: blob round-trip content mismatch"; exit 1; }
+          echo "Netlify blob round-trip OK (bootstrap + edge + restore verified)"
 
       - name: Verify GitLab credential
         env:
