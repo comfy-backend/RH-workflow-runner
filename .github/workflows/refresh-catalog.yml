@@ -35,16 +35,16 @@ name: Refresh RH Catalog
 on:
   schedule:
     # Daily at 09:00 UTC = 02:00 PT (avoid peak RH traffic)
-    - cron: '0 9 * * *'
+    - cron: '7 9 * * *'
     # Weekly FULL refresh Sunday 10:00 UTC. The daily incremental (sort=NEW,
     # early-stop on known workflows) misses stragglers: useCount/rank updates,
     # workflows re-sorted out of NEW order, and anything RH re-publishes. The
     # weekly full crawl re-walks ALL list pages and reconciles the catalog.
-    # Detected via github.event.schedule == '0 10 * * 0' (Phase 2) — schedule
+    # Detected via github.event.schedule == '7 10 * * 0' (Phase 2) — schedule
     # events can't carry workflow_dispatch inputs, so the cron string itself
     # is the signal. Offset +1h from the daily run; the 'refresh-catalog'
     # concurrency group serializes them anyway.
-    - cron: '0 10 * * 0'
+    - cron: '7 10 * * 0'
   workflow_dispatch:
     inputs:
       full_refresh:
@@ -181,6 +181,7 @@ jobs:
             data/catalog.db
             data/exports/
             data/details/
+            data/snapshots/
           key: rh-catalog-v3-${{ github.run_id }}
           restore-keys: |
             rh-catalog-v3-
@@ -256,7 +257,7 @@ jobs:
               # missing-driven crawl re-walks it; see restore_from_turso).
               if [ -n "$TURSO_DB_URL" ] && [ -n "$TURSO_DB_TOKEN" ]; then
                 echo "No usable DB carrier in the data repo — restoring the workflow side from Turso"
-                if ! python3 -m rh_catalog.cli restore-turso --out data/catalog.db; then
+                if ! python3 -m rh_catalog.cli restore-turso --out data/catalog.db --skip-analysis; then
                   echo "::warning::Turso restore failed — starting from an EMPTY DB (full re-crawl)"
                 fi
               else
@@ -296,7 +297,7 @@ jobs:
           # Full crawl when: manual dispatch asked for it, OR this run was
           # triggered by the weekly Sunday schedule (github.event.schedule
           # carries the exact cron string that fired this run).
-          if [ "${{ github.event.inputs.full_refresh }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 10 * * 0" ]; then
+          if [ "${{ github.event.inputs.full_refresh }}" = "true" ] || [ "${{ github.event.schedule }}" = "7 10 * * 0" ]; then
             echo "Full refresh — crawling all pages (slow, ~48 min)"
             python3 -m rh_catalog.cli --log-level INFO crawl --phase list --full
           else
@@ -312,7 +313,7 @@ jobs:
           # full (empty .cn stop-set walks all ~392 pages), and a walk killed
           # mid-crawl recovers via a full_refresh dispatch (daily
           # incrementals alone cannot reach a deep un-enrolled tail).
-          if [ "${{ github.event.inputs.full_refresh }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 10 * * 0" ]; then
+          if [ "${{ github.event.inputs.full_refresh }}" = "true" ] || [ "${{ github.event.schedule }}" = "7 10 * * 0" ]; then
             echo ".cn full refresh — re-walking all ~392 pages (~16 min)"
             python3 -m rh_catalog.cli --log-level INFO crawl --phase list --full --domain cn
           else
@@ -398,15 +399,15 @@ jobs:
         continue-on-error: true
         run: |
           mode_args="--incremental"
-          if [ "${{ github.event.schedule }}" = "0 10 * * 0" ] || [ "${{ github.event.inputs.full_refresh }}" = "true" ]; then
+          if [ "${{ github.event.schedule }}" = "7 10 * * 0" ] || [ "${{ github.event.inputs.full_refresh }}" = "true" ]; then
             echo "App galleries FULL crawl (all pages + GC, both domains)"
             mode_args=""
           else
             echo "App galleries incremental (early-stop) + missing-driven detail (both domains)"
           fi
           rc=0
-          python3 -m rh_catalog.cli --log-level INFO apps --domain ai --crawl $mode_args --detail || rc=1
-          python3 -m rh_catalog.cli --log-level INFO apps --domain cn --crawl $mode_args --detail || rc=1
+          python3 -m rh_catalog.cli --log-level INFO apps --domain ai --crawl $mode_args --detail --detail-limit 50000 || rc=1
+          python3 -m rh_catalog.cli --log-level INFO apps --domain cn --crawl $mode_args --detail --detail-limit 50000 || rc=1
           exit $rc
 
       - name: Record app-gallery step status
@@ -608,6 +609,10 @@ jobs:
             sleep $((i * 30))
           done
           echo "GitLab push failed after 5 attempts — will retry next run"
+          # R4-D P2-3: a permanently-dead DR-bootstrap mirror must not be
+          # silently green — the marker reddens the run (deferred) via the
+          # gate below so the cron-failure alert carries the signal.
+          echo "CODE_MIRROR_FAILED=true" >> "$GITHUB_ENV"
           exit 0
 
       # ---------------------------------------------------------------------
@@ -704,7 +709,7 @@ jobs:
         # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
         # for a month) gets surfaced: chunked_data_sync.py exports
         # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
-        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true')
+        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true')
         run: |
           failed=0
           if [ "${TURSO_SYNC_FAILED:-false}" = "true" ]; then
@@ -721,6 +726,10 @@ jobs:
           fi
           if [ "${DATA_PUSH_FAILED:-false}" = "true" ]; then
             echo "::error::Data-repo pushes failed earlier in this run (Phase 8 — deferred, remotes: ${DATA_PUSH_FAILED_REMOTES:-unknown}). The local catalog.db/exports sync and all later backup steps completed, but the listed remote(s) may be STALE. A fast-forward-only push could not advance them (see the Phase 8 log for the exact reason: divergence / remote ahead / retries exhausted)."
+            failed=1
+          fi
+          if [ "${CODE_MIRROR_FAILED:-false}" = "true" ]; then
+            echo "::error::Code-repo GitLab mirror push failed earlier in this run (5 attempts — the DR-bootstrap mirror is stale). The primary (GitHub) and the Netlify third copy are unaffected; the mirror will retry next run, but a persistent failure needs the GitLab WAF/quota checked."
             failed=1
           fi
           if [ "${NETLIFY_BACKUP_FAILED:-false}" = "true" ]; then
@@ -822,6 +831,7 @@ jobs:
               process.env.APPS_CRAWL_FAILED === 'true' ||
               process.env.DATA_PUSH_FAILED === 'true' ||
               process.env.NETLIFY_BACKUP_FAILED === 'true' ||
+              process.env.CODE_MIRROR_FAILED === 'true' ||
               process.env.DEFERRED_FAILURE_RAISED === 'true';
             // Failure signal: prior step(s) failed OR jobConclusion (post-run)
             // is 'failure' OR a deferred-failure flag is set. The first clause
@@ -1062,9 +1072,12 @@ jobs:
                   core.info(`gitlab-quota issue #${issue.number} already updated today — skipping comment.`);
                 }
               }
-            } else if (glQuotaIssues.length > 0 && process.env.DATA_PUSH_FAILED !== 'true') {
-              // No quota-blocked remote + no unexpected push failure —
-              // the mirror advanced (or was never blocked) -> close.
+            } else if (glQuotaIssues.length > 0 && process.env.DATA_PUSH_FAILED === 'false') {
+              // Positive evidence only (R4-D P2-1): 'false' means the
+              // exporter ran and every push advanced. UNSET means Phase 8
+              // crashed before exporting — NOT evidence of recovery; leave
+              // the issue open. (The turso lifecycle's TURSO_SYNC_RAN is
+              // the same positive-evidence pattern.)
               for (const issue of glQuotaIssues) {
                 await github.rest.issues.createComment({
                   owner: alertOwner,
