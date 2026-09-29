@@ -37,7 +37,7 @@ jobs:
           test -f rh_catalog/cli.py || { echo "FATAL: code checkout incomplete"; exit 1; }
           echo "Code repo OK at $(git rev-parse HEAD)"
 
-      - name: Clone data repo (auth check, no LFS pull)
+      - name: Clone data repo (auth check, manifest-only sparse)
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -47,10 +47,18 @@ jobs:
           rm -rf /tmp/rh-data-smoke
           # Smudge OFF: the LFS budget block (issue #18) rejects READS too
           # since 2026-09-25 — a smudged checkout dies with exit 128 (this
-          # exact crash broke the smoke on Sep 25+ pushes). The pointer
-          # stubs prove clone+tree access, which is all this step tests.
+          # exact crash broke the smoke on Sep 25+ pushes).
           export GIT_LFS_SKIP_SMUDGE=1
-          git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" /tmp/rh-data-smoke
+          # T6 (2026-09-29): the tree grew to ~6.3 GB (shards) and the full
+          # depth-1 checkout started eating the 10-min smoke budget (the
+          # 12:33/12:49 runs timed out AT this step — a timeout shows as
+          # 'cancelled'). This step only needs auth + structure proof:
+          # blobless clone + a non-cone sparse pattern for the ONE file we
+          # assert (the manifest) — kilobytes instead of gigabytes.
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" /tmp/rh-data-smoke
+          git -C /tmp/rh-data-smoke sparse-checkout set --no-cone '/shards/MANIFEST.json'
+
           # T1 M3 (2026-09-29): the catalog.db.gz pointer is RETIRED from
           # the tree (out-of-band cutover dc52ed3) — the HARD assertion is
           # now the shard carrier (round-3 audit R3-B F1: the old pointer
