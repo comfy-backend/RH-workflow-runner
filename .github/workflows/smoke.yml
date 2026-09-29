@@ -92,17 +92,22 @@ jobs:
           # (site:rh-backup-smoke, never the production store). If the
           # backup arm breaks (API drift, auth death, a code regression),
           # smoke goes red on the next runner push — that is the point.
+          # NOTE: stay in the WORKSPACE (the CLI needs rh_catalog on
+          # sys.path — a `cd /tmp` broke the first run with
+          # ModuleNotFoundError); the tiny repo is addressed absolutely.
           set -e
           python3 -m pip install -q httpx
           rm -rf /tmp/rh-blob-smoke && mkdir -p /tmp/rh-blob-smoke
-          cd /tmp/rh-blob-smoke
-          git init -q -b main tiny
-          git -C tiny config user.name t && git -C tiny config user.email t@t
-          echo one > tiny/a.txt && git -C tiny add -A && git -C tiny commit -qm c1
+          git init -q -b main /tmp/rh-blob-smoke/tiny
+          git -C /tmp/rh-blob-smoke/tiny config user.name t
+          git -C /tmp/rh-blob-smoke/tiny config user.email t@t
+          echo one > /tmp/rh-blob-smoke/tiny/a.txt
+          git -C /tmp/rh-blob-smoke/tiny add -A && git -C /tmp/rh-blob-smoke/tiny commit -qm c1
           export NETLIFY_PAT NETLIFY_BLOB_SITE_ID
           # bootstrap (tiny repo is non-shallow -> the real bootstrap path)
           python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-blob-smoke/tiny --store site:rh-backup-smoke
-          echo two > tiny/b.txt && git -C tiny add -A && git -C tiny commit -qm c2
+          echo two > /tmp/rh-blob-smoke/tiny/b.txt
+          git -C /tmp/rh-blob-smoke/tiny add -A && git -C /tmp/rh-blob-smoke/tiny commit -qm c2
           # incremental edge
           python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-blob-smoke/tiny --store site:rh-backup-smoke
           # restore + assert exact history
