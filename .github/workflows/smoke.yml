@@ -112,8 +112,16 @@ jobs:
           echo one > /tmp/rh-blob-smoke/tiny/a.txt
           git -C /tmp/rh-blob-smoke/tiny add -A && git -C /tmp/rh-blob-smoke/tiny commit -qm c1
           export NETLIFY_PAT NETLIFY_BLOB_SITE_ID
-          # bootstrap (tiny repo is non-shallow -> the real bootstrap path)
-          python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-blob-smoke/tiny --store site:rh-backup-smoke
+          # bootstrap (tiny repo is non-shallow -> the real bootstrap path).
+          # R5-B/R5-C P1 (2026-09-30): --reseed is REQUIRED — each canary
+          # rebuilds the tiny repo from scratch (fresh timestamps -> fresh
+          # SHAs), so the persistent smoke-store manifest can never match a
+          # fetchable base and every 2nd+ run wedged with "no fetchable
+          # base" (live-red since 03:14 UTC on push 3a7373c). Reseeding
+          # each run keeps the canary self-consistent forever: fresh seed
+          # at the fresh head, GC of the superseded keys, then the real
+          # incremental edge + restore assertions below.
+          python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-blob-smoke/tiny --store site:rh-backup-smoke --reseed
           echo two > /tmp/rh-blob-smoke/tiny/b.txt
           git -C /tmp/rh-blob-smoke/tiny add -A && git -C /tmp/rh-blob-smoke/tiny commit -qm c2
           # incremental edge
@@ -127,6 +135,10 @@ jobs:
           echo "Netlify blob round-trip OK (bootstrap + edge + restore verified)"
 
       - name: Verify GitLab credential
+        # R5-B P1 (2026-09-30): the canary wedging red SKIPPED these
+        # liveness checks silently — a red canary must not blind the
+        # GitLab-credential and alert-path verifiers too.
+        if: always()
         env:
           GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
         run: |
@@ -144,6 +156,10 @@ jobs:
           fi
 
       - name: Verify alert path (comment on private repo)
+        # R5-B P1 (2026-09-30): the canary wedging red SKIPPED these
+        # liveness checks silently — a red canary must not blind the
+        # GitLab-credential and alert-path verifiers too.
+        if: always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GH_PAT }}

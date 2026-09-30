@@ -535,7 +535,13 @@ jobs:
           if [ ! -d "$RH_DATA_REPO/.git" ]; then
             git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" "$RH_DATA_REPO"
           else
-            git -C "$RH_DATA_REPO" remote set-url origin "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git"
+            # R5-C P1-1 (2026-09-30): a blob-rung-restored clone has NO
+            # 'origin' remote (restore() clones from a local bundle FILE) —
+            # set-url exits 2 under bash -e and reds the run right after a
+            # SUCCESSFUL DR restore, losing that day's crawl push. Add the
+            # remote if missing, then (re)point it at the credential URL.
+            git -C "$RH_DATA_REPO" remote add origin "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git" 2>/dev/null \
+              || git -C "$RH_DATA_REPO" remote set-url origin "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/RH-workflow-data.git"
           fi
           git -C "$RH_DATA_REPO" lfs install || true
           # NOTE (session-8 coverage audit): no LFS pull here on purpose —
@@ -734,6 +740,20 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/run_gap_check.py
 
+      - name: Record direct-step failure (jobs-API lag backstop)
+        # R5-A P1-1 / R5-B P2-2 (2026-09-30): the alert step's failure
+        # signal is failedSteps from listJobsForWorkflowRun — the SAME API
+        # that on 2026-09-02 lagged 1.2 s behind a failed step and wrongly
+        # closed the tracking issue as "Resolved". Every deferred marker has
+        # an env backstop; direct step failures (any phase hard-fail, the
+        # commit+push, the run-gap detector) had NONE. This marker is
+        # written the moment any prior step fails — env vars cannot lag —
+        # and the alert step ORs it into isFailure. Runs BEFORE the
+        # deferred-failure gate so the gate can also re-raise it; the
+        # gate's own failure is covered by DEFERRED_FAILURE_RAISED.
+        if: always() && failure()
+        run: echo "DIRECT_STEP_FAILED=true" >> "$GITHUB_ENV"
+
       - name: Fail run if a deferred failure is pending (after data backup)
         # DEFERRED FAILURES re-raised here: Phase 5.5 (model registry),
         # Phase 7 (Turso), and Phase 8 data-repo PUSH outcomes all run with
@@ -748,7 +768,7 @@ jobs:
         # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
         # for a month) gets surfaced: chunked_data_sync.py exports
         # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
-        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true')
+        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
         run: |
           failed=0
           if [ "${TURSO_SYNC_FAILED:-false}" = "true" ]; then
@@ -769,6 +789,10 @@ jobs:
           fi
           if [ "${CODE_MIRROR_FAILED:-false}" = "true" ]; then
             echo "::error::Code-repo GitLab mirror push failed earlier in this run (5 attempts — the DR-bootstrap mirror is stale). The primary (GitHub) and the Netlify third copy are unaffected; the mirror will retry next run, but a persistent failure needs the GitLab WAF/quota checked."
+            failed=1
+          fi
+          if [ "${DIRECT_STEP_FAILED:-false}" = "true" ]; then
+            echo "::error::A step failed directly earlier in this run (see the failed step list / annotations for WHICH one — the env marker is the lag-proof backstop for the jobs-API race of 2026-09-02). All data-bearing steps that could still run, completed."
             failed=1
           fi
           if [ "${NETLIFY_BACKUP_FAILED:-false}" = "true" ]; then
@@ -871,6 +895,7 @@ jobs:
               process.env.DATA_PUSH_FAILED === 'true' ||
               process.env.NETLIFY_BACKUP_FAILED === 'true' ||
               process.env.CODE_MIRROR_FAILED === 'true' ||
+              process.env.DIRECT_STEP_FAILED === 'true' ||
               process.env.DEFERRED_FAILURE_RAISED === 'true';
             // Failure signal: prior step(s) failed OR jobConclusion (post-run)
             // is 'failure' OR a deferred-failure flag is set. The first clause

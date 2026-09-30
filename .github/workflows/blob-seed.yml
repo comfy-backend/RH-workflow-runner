@@ -2,7 +2,7 @@ name: Blob backup seed (T6)
 
 # T6 (2026-09-29): one-time (or recovery) SEED of the Netlify blob store —
 # the full-history bundle (~3.3 GB) the daily chain extends from. Dispatch
-# manually; NEVER runs on a schedule. The daily Phase 8.5 step refuses to
+# manually for seeding. The daily Phase 8.5 step refuses to
 # bootstrap from its shallow clone by design (a shallow seed is uncloneable
 # — round4-t6-design-review T6) — THIS workflow carries a FULL clone.
 #
@@ -10,12 +10,30 @@ name: Blob backup seed (T6)
 # superseded keys (crash-safe order; never overwrites the live seed). Use
 # after a chain wedge the supersede-tail repair could not heal, or to reset
 # store bloat.
+#
+# MONTHLY VERIFY (F13, R5-B P2-4, 2026-09-30): the daily Phase 8.5 only
+# HEAD-sizes the seed (3.13 GB — byte re-GETs are daily-edge-only), so the
+# seed's BYTES are verified exactly once, at seed time. Silent seed
+# corruption (bit-rot, a bad upload, a store-side incident) would surface
+# only at DR time — the worst possible moment. The 1st-of-month schedule
+# runs the SAME restore+verify block as the post-seed check (downloads the
+# real chain, sha-verifies every bundle, fsck, head assert) and PUTs
+# nothing. A red monthly run is the signal (Actions tab; no tracker issue —
+# the alert machinery lives in refresh-catalog.yml and this is a
+# maintenance job an operator reviews).
 
 on:
+  schedule:
+    # 1st of month, 04:23 UTC (off-hour minute; far from both daily windows)
+    - cron: '23 4 1 * *'
   workflow_dispatch:
     inputs:
       reseed:
         description: "Force a fresh seed + chain reset (swaps + GCs; nothing is overwritten in place)"
+        type: boolean
+        default: false
+      verify_only:
+        description: "Skip seeding; only run the restore+verify (the monthly schedule's path — use it to re-verify the seed's bytes anytime)"
         type: boolean
         default: false
 
@@ -60,6 +78,7 @@ jobs:
           git config --global user.email "223220792+beulahkemp@users.noreply.github.com"
 
       - name: Full clone of the data repo (seeding needs COMPLETE history)
+        if: github.event_name == 'workflow_dispatch' && inputs.verify_only != true
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -71,6 +90,7 @@ jobs:
           echo "Cloned: $(git -C /tmp/rh-data-seed log --oneline -1) ($(du -sh /tmp/rh-data-seed/.git | cut -f1) .git)"
 
       - name: Seed (or re-seed) the blob store
+        if: github.event_name == 'workflow_dispatch' && inputs.verify_only != true
         env:
           NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
           NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
@@ -80,6 +100,10 @@ jobs:
           python3 -m rh_catalog.cli blobs-sync --data-repo /tmp/rh-data-seed $RESEED_FLAG
 
       - name: Post-seed verification (restore the chain head)
+        # Runs on EVERY trigger (dispatch seed, dispatch verify-only, and
+        # the monthly schedule) — the restore is the only proof the chain
+        # actually reproduces the repo (sha-verified downloads, per-edge
+        # bundle verify, final-head assert, fsck with --verify).
         env:
           NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
           NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
