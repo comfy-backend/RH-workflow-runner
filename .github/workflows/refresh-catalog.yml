@@ -36,6 +36,18 @@ on:
   schedule:
     # Daily at 09:00 UTC = 02:00 PT (avoid peak RH traffic)
     - cron: '7 9 * * *'
+    # R4-D P2-2 (production evidence 2026-09-29): GitHub's Actions queue
+    # DROPPED the 09:07 daily entirely that day (the 9-28 one had already
+    # fired 8.2 h late — documented drop/delay behavior for public-repo
+    # scheduled workflows under load). A dropped daily is a silent 24 h
+    # hole in crawl + shards + Turso + the Netlify blob chain, with NO
+    # signal (no run = no alert). This redundant window is half the fix:
+    # two independent firing windows ~12.5 h apart mean a full-day hole
+    # requires BOTH to drop. The pipeline is idempotent (incremental crawl
+    # early-stops; blob sync no-ops on an unchanged HEAD), so a day where
+    # both fire just costs one cheap no-op run. The other half is the
+    # run-gap detector step at the tail of the refresh job.
+    - cron: '37 21 * * *'
     # Weekly FULL refresh Sunday 10:00 UTC. The daily incremental (sort=NEW,
     # early-stop on known workflows) misses stragglers: useCount/rank updates,
     # workflows re-sorted out of NEW order, and anything RH re-publishes. The
@@ -694,6 +706,33 @@ jobs:
           path: /tmp/static-ui-bundle.zip
           retention-days: 30
           if-no-files-found: error
+
+      - name: Run-gap detector (missed-run watchdog)
+        # Production evidence 2026-09-29: the 09:07 scheduled run was
+        # DROPPED by the GitHub Actions queue (the 9-28 firing itself was
+        # 8.2 h late). A dropped daily is a silent 24 h hole in crawl +
+        # shards + Turso + the Netlify blob chain — and NO signal, because
+        # every alert in this workflow hangs off run outcomes and a run
+        # that never existed cannot fail. This step closes that hole from
+        # INSIDE the next run that does fire: if the previous COMPLETED
+        # run of this workflow (schedule/dispatch classes only — push runs
+        # exercise the test job and move no data, so they never mask a
+        # gap) is older than 36 h, this step fails the run and the alert
+        # step below opens the cron-failed tracking issue with this step
+        # in its failed-step list. Detection latency is bounded by
+        # "whenever any run finally fires"; the out-of-band heartbeat for
+        # the everything-dead case stays a PLAN item.
+        # Threshold math: 36 h = 24 h nominal + the 8.2 h worst observed
+        # queue drift + margin. It catches two consecutive missed windows
+        # (>= 37.5 h apart with both daily crons live) while a single
+        # self-healing drop stays green. An API failure downgrades to a
+        # warning — observability must never break the envelope it
+        # watches. Runs AFTER all data-bearing steps (only the deferred
+        # gate and the alert follow it).
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/run_gap_check.py
 
       - name: Fail run if a deferred failure is pending (after data backup)
         # DEFERRED FAILURES re-raised here: Phase 5.5 (model registry),
