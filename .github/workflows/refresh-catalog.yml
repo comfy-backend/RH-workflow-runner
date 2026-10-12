@@ -433,6 +433,38 @@ jobs:
             echo "APPS_CRAWL_FAILED=false" >> "$GITHUB_ENV"
           fi
 
+      - name: "Phase 5.8 — Editor-surface enrollment (H6, the hidden universes)"
+        id: editor_surface
+        # H6 Phase 1 (session #21, 2026-10-12): enroll the four surfaces the
+        # listing crawls structurally cannot see — U0 official ComfyUI
+        # editor starter templates (8 ids -> detail+export upserts into
+        # `workflow`), U3 fast-creation webapp bindings (both domains; the
+        # derived webapp->workflow linkage + gallery_hidden flags run AFTER
+        # the 5.7 app crawl so the rh_app join is fresh), U4 canvas editor
+        # catalogs (252 official templates with graph JSON + census columns,
+        # 77 community compositions, 209 QC inspiration templates), U5 QC
+        # SKU bindings (140). ~17 requests/day, zero auth.
+        #
+        # DEFERRED-FAILURE (same doctrine as 5.5/5.7): additive reference
+        # surfaces; an outage must never skip the workflow refresh/backup
+        # steps. Re-raised after data backup via EDITOR_SURFACE_FAILED.
+        continue-on-error: true
+        run: |
+          rc=0
+          python3 -m rh_catalog.cli --log-level INFO editor-surface --crawl || rc=1
+          exit $rc
+
+      - name: Record editor-surface step status
+        run: |
+          outcome="${{ steps.editor_surface.outcome }}"
+          echo "editor-surface step outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "EDITOR_SURFACE_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Editor-surface enrollment failed (Phase 5.8) — CONTINUING; the run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "EDITOR_SURFACE_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Phase 6 — Snapshot
         run: python3 -m rh_catalog.cli snapshot
 
@@ -768,7 +800,7 @@ jobs:
         # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
         # for a month) gets surfaced: chunked_data_sync.py exports
         # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
-        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
+        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.EDITOR_SURFACE_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
         run: |
           failed=0
           if [ "${TURSO_SYNC_FAILED:-false}" = "true" ]; then
@@ -781,6 +813,10 @@ jobs:
           fi
           if [ "${APPS_CRAWL_FAILED:-false}" = "true" ]; then
             echo "::error::AI-App gallery crawl failed earlier in this run (Phase 5.7 — deferred). Data backup completed; the rh_app gallery table is stale. The next run retries (list incremental is cheap; detail is missing-driven and resumable)."
+            failed=1
+          fi
+          if [ "${EDITOR_SURFACE_FAILED:-false}" = "true" ]; then
+            echo "::error::Editor-surface enrollment failed earlier in this run (Phase 5.8 — deferred). Data backup completed; the H6 reference tables (starters / fast-creation / canvas / QC) are stale. The next run retries the full enrollment (idempotent no-op-guarded upserts, ~17 requests)."
             failed=1
           fi
           if [ "${DATA_PUSH_FAILED:-false}" = "true" ]; then
@@ -892,6 +928,7 @@ jobs:
               process.env.TURSO_SYNC_FAILED === 'true' ||
               process.env.MODELS_STEP_FAILED === 'true' ||
               process.env.APPS_CRAWL_FAILED === 'true' ||
+              process.env.EDITOR_SURFACE_FAILED === 'true' ||
               process.env.DATA_PUSH_FAILED === 'true' ||
               process.env.NETLIFY_BACKUP_FAILED === 'true' ||
               process.env.CODE_MIRROR_FAILED === 'true' ||
