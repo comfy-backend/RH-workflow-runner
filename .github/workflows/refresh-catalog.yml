@@ -496,7 +496,7 @@ jobs:
         continue-on-error: true
         run: |
           rc=0
-          python3 -m rh_catalog.cli --log-level INFO canvas-resources --crawl --download-assets light || rc=1
+          python3 -m rh_catalog.cli --log-level INFO canvas-resources --crawl --import-har --download-assets light || rc=1
           exit $rc
 
       - name: Record canvas-resources step status
