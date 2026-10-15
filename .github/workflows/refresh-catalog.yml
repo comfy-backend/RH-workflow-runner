@@ -105,6 +105,13 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    env:
+      # H9 (session #24): the lockstep-family tests fetch THIS repo's deployed
+      # yml via the GitHub contents API (authoritative — the raw CDN lags
+      # pushes by minutes and false-failed run 38675150483). This token (the
+      # runner repo's own) lifts the anonymous 60/hr shared-IP rate limit.
+      # See tests/runner_wf.py for the fetch contract.
+      GH_RUNNER_FETCH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Check out code repo (private, via PAT)
         uses: actions/checkout@v4
@@ -313,9 +320,34 @@ jobs:
           fi
 
       - name: Phase 1 — Tag tree
+        id: p1_tree
+        # FAULT ISOLATION (H9, session #24): the crawl phases are missing-
+        # driven + idempotent, so a crash in ANY single phase must DEFER
+        # (flag + red run after data backup), never SKIP the phases after
+        # it. The 2026-10-13→15 outage: ONE reclassify crash skipped
+        # detail/export/5.x/snapshot/Phase-8 entirely — the data repo went
+        # stale for 2 days with zero data pushed. Data preservation first.
+        continue-on-error: true
+        timeout-minutes: 10
         run: python3 -m rh_catalog.cli --log-level INFO crawl --phase tag_tree
 
+      - name: Record tag-tree step status
+        run: |
+          outcome="${{ steps.p1_tree.outcome }}"
+          echo "tag-tree outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "P1_TREE_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Tag-tree phase failed (Phase 1 — deferred). Detail/export crawls continue against the existing marks; the run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "P1_TREE_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Phase 2 — List crawl
+        id: list_crawl
+        continue-on-error: true
+        # H9 fault isolation: a list-crawl crash defers — the detail/export
+        # phases and the Phase-8 data push still run on the existing marks.
+        timeout-minutes: 90
         run: |
           # Full crawl when: manual dispatch asked for it, OR this run was
           # triggered by the weekly Sunday schedule (github.event.schedule
@@ -328,7 +360,21 @@ jobs:
             python3 -m rh_catalog.cli --log-level INFO crawl --phase list --incremental
           fi
 
+      - name: Record list-crawl step status
+        run: |
+          outcome="${{ steps.list_crawl.outcome }}"
+          echo "list crawl outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "LIST_CRAWL_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::List crawl failed (Phase 2 — deferred). The run continues; the next run's incremental re-walks the gap (missing-driven). The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "LIST_CRAWL_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Phase 2.5 — .cn list crawl (the v2 second source, runninghub.cn)
+        id: cn_crawl
+        continue-on-error: true
+        timeout-minutes: 90
         run: |
           # The .cn regional catalog (same workflow-id space, ~16.4k net-new
           # ids, divergence measured 2026-06-25). Branches on full/Sunday
@@ -344,13 +390,51 @@ jobs:
             python3 -m rh_catalog.cli --log-level INFO crawl --phase list --incremental --domain cn
           fi
 
+      - name: Record cn-list-crawl step status
+        run: |
+          outcome="${{ steps.cn_crawl.outcome }}"
+          echo "cn list crawl outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "CN_CRAWL_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::.cn list crawl failed (Phase 2.5 — deferred). The run continues; the next run re-walks .cn incrementally. The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "CN_CRAWL_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Re-classify media types
+        id: reclassify
+        # H9 fault isolation: THIS exact step crashed 2026-10-13→15 (the
+        # NULL GROUP BY key class — code fixed in session #23) and its
+        # hard-fail skip cascade stalled the whole pipeline for 4 runs.
+        # Belt-and-braces: even a future reclassify crash only defers now.
+        continue-on-error: true
+        timeout-minutes: 15
         run: python3 scripts/reclassify_media.py
 
+      - name: Record reclassify step status
+        run: |
+          outcome="${{ steps.reclassify.outcome }}"
+          echo "reclassify outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "RECLASSIFY_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Re-classify failed — deferred (media_type stays at previous values; the code-level NULL-key fix is session #23's, this is the isolation belt-and-braces). The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "RECLASSIFY_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Show stats after list crawl
+        # Cosmetic — a stats crash (the §31 NULL-key class) must never
+        # hard-fail the chain again.
+        continue-on-error: true
         run: python3 -m rh_catalog.cli stats
 
       - name: Phase 3 — Detail crawl
+        id: detail_crawl
+        continue-on-error: true
+        # H9 fault isolation: the heaviest crawl (~25-35 min dual-domain).
+        # A crash defers — export crawl + snapshot + Phase-8 still run;
+        # detail is missing-driven and resumes on the next run.
+        timeout-minutes: 150
         run: |
           if [ "${{ github.event.inputs.priority_only }}" = "false" ]; then
             python3 -m rh_catalog.cli --log-level INFO crawl --phase detail --no-priority-only
@@ -358,7 +442,21 @@ jobs:
             python3 -m rh_catalog.cli --log-level INFO crawl --phase detail --priority-only --limit 50000
           fi
 
+      - name: Record detail-crawl step status
+        run: |
+          outcome="${{ steps.detail_crawl.outcome }}"
+          echo "detail crawl outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "DETAIL_CRAWL_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Detail crawl failed (Phase 3 — deferred). The run continues; detail is missing-driven and resumes next run. The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "DETAIL_CRAWL_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Phase 4 — Export crawl
+        id: export_crawl
+        continue-on-error: true
+        timeout-minutes: 60
         run: |
           if [ "${{ github.event.inputs.priority_only }}" = "false" ]; then
             python3 -m rh_catalog.cli --log-level INFO crawl --phase export --no-priority-only
@@ -366,8 +464,35 @@ jobs:
             python3 -m rh_catalog.cli --log-level INFO crawl --phase export --priority-only --limit 50000
           fi
 
+      - name: Record export-crawl step status
+        run: |
+          outcome="${{ steps.export_crawl.outcome }}"
+          echo "export crawl outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "EXPORT_CRAWL_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Export crawl failed (Phase 4 — deferred). The run continues; exports are missing-driven and resume next run. The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "EXPORT_CRAWL_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Phase 5 — Analyze
+        id: analyze
+        continue-on-error: true
+        # H9 fault isolation: analysis is regenerable local work — its
+        # crash must never skip snapshot/Phase-8 data preservation.
+        timeout-minutes: 45
         run: python3 -m rh_catalog.cli --log-level INFO analyze --no-priority-only
+
+      - name: Record analyze step status
+        run: |
+          outcome="${{ steps.analyze.outcome }}"
+          echo "analyze outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "ANALYZE_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Analyze failed (Phase 5 — deferred). The run continues; analysis is regenerable and re-runs next run. The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "ANALYZE_FAILED=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Phase 5.5 — RH model registry (crawl if stale + resolve refs)
         id: models_reg
@@ -386,6 +511,9 @@ jobs:
         # by "Fail run if a deferred failure is pending" so the run still
         # turns red and the cron-failure alert fires.
         continue-on-error: true
+        # H9: per-step timeout — a hang must not eat the 300-min job budget
+        # before the data-preservation tail (Phase 6/8) gets its turn.
+        timeout-minutes: 45
         run: python3 -m rh_catalog.cli --log-level INFO models --crawl --resolve
 
       - name: Record model-registry step status
@@ -420,6 +548,8 @@ jobs:
         # .cn fails), non-short-circuit sequencing with an aggregated exit
         # code so one domain's failure defers red but the other still runs.
         continue-on-error: true
+        # H9: per-step timeout (hang protection — see Phase 5.5).
+        timeout-minutes: 60
         run: |
           mode_args="--incremental"
           if [ "${{ github.event.schedule }}" = "7 10 * * 0" ] || [ "${{ github.event.inputs.full_refresh }}" = "true" ]; then
@@ -460,6 +590,8 @@ jobs:
         # surfaces; an outage must never skip the workflow refresh/backup
         # steps. Re-raised after data backup via EDITOR_SURFACE_FAILED.
         continue-on-error: true
+        # H9: per-step timeout (hang protection — see Phase 5.5).
+        timeout-minutes: 30
         run: |
           rc=0
           python3 -m rh_catalog.cli --log-level INFO editor-surface --crawl || rc=1
@@ -494,6 +626,8 @@ jobs:
         # surfaces; an outage must never skip the workflow refresh/backup
         # steps. Re-raised after data backup via CANVAS_RESOURCES_FAILED.
         continue-on-error: true
+        # H9: per-step timeout (hang protection — see Phase 5.5).
+        timeout-minutes: 45
         run: |
           rc=0
           python3 -m rh_catalog.cli --log-level INFO canvas-resources --crawl --import-har --download-assets light || rc=1
@@ -517,9 +651,29 @@ jobs:
           fi
 
       - name: Phase 6 — Snapshot
+        id: snapshot
+        continue-on-error: true
+        # H9 fault isolation: snapshot feeds the Turso lean tables + the
+        # static UI. A crash defers (SNAPSHOT_FAILED) — Phase 8 still syncs
+        # the DB + exports (the primary carriers); the Turso lean replica
+        # and the static-UI bundle go stale for THIS run only.
+        timeout-minutes: 20
         run: python3 -m rh_catalog.cli snapshot
 
+      - name: Record snapshot step status
+        run: |
+          outcome="${{ steps.snapshot.outcome }}"
+          echo "snapshot outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "SNAPSHOT_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Snapshot failed (Phase 6 — deferred). Phase 8 still syncs DB+exports (the primary carriers); the Turso lean replica and the static-UI bundle go stale this run. The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "SNAPSHOT_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Show final stats
+        # Cosmetic — same §31-class protection as the mid-list stats step.
+        continue-on-error: true
         run: python3 -m rh_catalog.cli stats
 
       - name: Phase 7 — Sync to Turso (native SDK, best-effort)
@@ -540,6 +694,8 @@ jobs:
         # issue (managed by the alert step below) carries the signal instead.
         # Any other non-zero exit stays a real (deferred) failure.
         continue-on-error: true
+        # H9: per-step timeout (hang protection — see Phase 5.5).
+        timeout-minutes: 30
         if: github.event.inputs.skip_turso != 'true'
         env:
           TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
@@ -599,6 +755,10 @@ jobs:
         run: df -h / | tail -1
 
       - name: Phase 8 — Sync to data repo (SQLite DB + snapshot + JSON exports)
+        # H9: per-step timeout — the data-preservation core gets a generous
+        # ceiling, but even it must not hang the job into the 300-min kill
+        # (which would cancel BEFORE the alert step could run).
+        timeout-minutes: 120
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
@@ -635,6 +795,8 @@ jobs:
           python3 scripts/chunked_data_sync.py --chunk-size 5000 --data-repo "$RH_DATA_REPO"
 
       - name: Phase 8.5 — Backup data repo to Netlify Blobs (bundle chain, T6)
+        # H9: per-step timeout (hang protection — see Phase 8).
+        timeout-minutes: 30
         env:
           NETLIFY_PAT: ${{ secrets.NETLIFY_PAT }}
           NETLIFY_BLOB_SITE_ID: ${{ secrets.NETLIFY_BLOB_SITE_ID }}
@@ -692,6 +854,8 @@ jobs:
           fi
 
       - name: Push to GitLab (redundant backup)
+        # H9: per-step timeout (hang protection — see Phase 8).
+        timeout-minutes: 15
         env:
           GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
         run: |
@@ -797,6 +961,8 @@ jobs:
           if-no-files-found: error
 
       - name: Run-gap detector (missed-run watchdog)
+        # H9: per-step timeout (hang protection — see Phase 8).
+        timeout-minutes: 10
         # Production evidence 2026-09-29: the 09:07 scheduled run was
         # DROPPED by the GitHub Actions queue (the 9-28 firing itself was
         # 8.2 h late). A dropped daily is a silent 24 h hole in crawl +
@@ -851,9 +1017,41 @@ jobs:
         # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
         # for a month) gets surfaced: chunked_data_sync.py exports
         # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
-        if: always() && (env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.EDITOR_SURFACE_FAILED == 'true' || env.CANVAS_RESOURCES_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
+        if: always() && (env.P1_TREE_FAILED == 'true' || env.LIST_CRAWL_FAILED == 'true' || env.CN_CRAWL_FAILED == 'true' || env.RECLASSIFY_FAILED == 'true' || env.DETAIL_CRAWL_FAILED == 'true' || env.EXPORT_CRAWL_FAILED == 'true' || env.ANALYZE_FAILED == 'true' || env.SNAPSHOT_FAILED == 'true' || env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.EDITOR_SURFACE_FAILED == 'true' || env.CANVAS_RESOURCES_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
         run: |
           failed=0
+          if [ "${P1_TREE_FAILED:-false}" = "true" ]; then
+            echo "::error::Tag-tree phase failed earlier in this run (Phase 1 — deferred, H9 mid-chain isolation). Data backup completed; the workflow tag tree is stale this run. The next run re-walks it (cheap, one API call family)."
+            failed=1
+          fi
+          if [ "${LIST_CRAWL_FAILED:-false}" = "true" ]; then
+            echo "::error::List crawl failed earlier in this run (Phase 2 — deferred, H9 mid-chain isolation). Data backup completed with the PREVIOUS catalog state; new workflows published since the last green run are not yet enrolled. The next incremental run re-walks the gap."
+            failed=1
+          fi
+          if [ "${CN_CRAWL_FAILED:-false}" = "true" ]; then
+            echo "::error::.cn list crawl failed earlier in this run (Phase 2.5 — deferred, H9 mid-chain isolation). Data backup completed; the .cn regional enrollment is stale this run. Recover via the next run (or a full_refresh dispatch if the gap is deep)."
+            failed=1
+          fi
+          if [ "${RECLASSIFY_FAILED:-false}" = "true" ]; then
+            echo "::error::Re-classify failed earlier in this run (H9 isolation of the 2026-10-13→15 crash site). Data backup completed; media_type classifications stay at previous values. Inspect scripts/reclassify_media.py — a NEW crash class (not the fixed NULL-key one) is likely."
+            failed=1
+          fi
+          if [ "${DETAIL_CRAWL_FAILED:-false}" = "true" ]; then
+            echo "::error::Detail crawl failed earlier in this run (Phase 3 — deferred, H9 mid-chain isolation). Data backup completed; details for workflows not yet walked are missing and the marks are unchanged — the crawl is missing-driven and resumes next run."
+            failed=1
+          fi
+          if [ "${EXPORT_CRAWL_FAILED:-false}" = "true" ]; then
+            echo "::error::Export crawl failed earlier in this run (Phase 4 — deferred, H9 mid-chain isolation). Data backup completed; ComfyUI JSON exports for newly-detailed workflows are missing. Export is missing-driven and resumes next run."
+            failed=1
+          fi
+          if [ "${ANALYZE_FAILED:-false}" = "true" ]; then
+            echo "::error::Analyze failed earlier in this run (Phase 5 — deferred, H9 mid-chain isolation). Data backup completed; analysis columns are stale for this batch. Analysis is regenerable local work and re-runs next run."
+            failed=1
+          fi
+          if [ "${SNAPSHOT_FAILED:-false}" = "true" ]; then
+            echo "::error::Snapshot failed earlier in this run (Phase 6 — deferred, H9 mid-chain isolation). Phase 8 still synced the DB + exports (primary carriers), but the Turso lean replica and the static-UI bundle are stale this run."
+            failed=1
+          fi
           if [ "${TURSO_SYNC_FAILED:-false}" = "true" ]; then
             echo "::error::Turso sync failed earlier in this run (Phase 7 — deferred). Data backup to the data repo + GitLab + the offline bundle completed; Turso (secondary mirror) is stale. Turso will self-heal on the next successful sync."
             failed=1
@@ -984,6 +1182,14 @@ jobs:
             // job — they cannot lag. hasFailures/jobConclusion stay in the
             // OR-chain to catch direct step failures the flags don't cover.
             const deferredFailureRaised =
+              process.env.P1_TREE_FAILED === 'true' ||
+              process.env.LIST_CRAWL_FAILED === 'true' ||
+              process.env.CN_CRAWL_FAILED === 'true' ||
+              process.env.RECLASSIFY_FAILED === 'true' ||
+              process.env.DETAIL_CRAWL_FAILED === 'true' ||
+              process.env.EXPORT_CRAWL_FAILED === 'true' ||
+              process.env.ANALYZE_FAILED === 'true' ||
+              process.env.SNAPSHOT_FAILED === 'true' ||
               process.env.TURSO_SYNC_FAILED === 'true' ||
               process.env.MODELS_STEP_FAILED === 'true' ||
               process.env.APPS_CRAWL_FAILED === 'true' ||
