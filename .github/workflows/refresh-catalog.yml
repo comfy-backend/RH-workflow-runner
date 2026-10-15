@@ -24,6 +24,15 @@ name: Refresh RH Catalog
 # Total wall-clock time: ~10 min (incremental) / ~25 min (full refresh with
 # Turso sync) / ~2.5-3h (first v2 backfill: .cn enrollment + .ai app gallery).
 #
+# H9 TIMEOUT LEDGER (2026-10-15): per-step ceilings are INDIVIDUAL caps,
+# not an additive budget — the job-level 300-min remains the only total.
+# Normal run ≈ 60-90 min. The ceilings guarantee no SINGLE hung step eats
+# the whole budget before the data-preservation tail (Phase 6/8/8.5/push/
+# mirror/alert) gets its turn; a pathological multi-phase day still cancels
+# at 300 (detected by the next run's run-gap detector — cancelled runs are
+# the red class there). Phase 8 (120) + tail (~60) fit under 300 by design:
+# the tail-fit test in tests/test_fault_isolation.py pins the margin.
+#
 # RUNNER CONTEXT (public-repo compute host): this workflow lives in the PUBLIC
 # comfy-backend/RH-workflow-runner repo for unlimited Actions minutes (the
 # beulahkemp account's Actions is billing-blocked, issue #13). All code and
@@ -208,6 +217,10 @@ jobs:
             rh-catalog-v3-
 
       - name: Restore DB from data repo (if cache missed)
+        # H9 (R2 P2-4): the biggest network step of the job (a ~1.5GB clone)
+        # gets a hard ceiling — a hang here previously killed the whole job
+        # into the 300-min GHA cancel (no data push, no alert).
+        timeout-minutes: 30
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
@@ -290,7 +303,7 @@ jobs:
             # uses FLAT paths (data/exports/<id>.json) — flatten while copying.
             if [ -d "$RH_DATA_REPO/exports" ]; then
               mkdir -p data/exports
-              (cd "$RH_DATA_REPO/exports" && find . -mindepth 2 -name '*.comfyui.json' -exec cp -t "$GITHUB_WORKSPACE/data/exports" {} +)
+              (cd "$RH_DATA_REPO/exports" && find . -mindepth 2 -name '*.comfyui.json' -exec cp -t "$GITHUB_WORKSPACE/data/exports" {} +) || echo "::warning::exports copy failed (disk pressure?) — the crawl re-exports missing files (missing-driven); continuing"
               echo "Restored $(find data/exports -name '*.comfyui.json' | wc -l) export files from data repo"
             fi
             # H7 (session #22, design r2 P0-1): cache-miss restore for the
@@ -312,11 +325,30 @@ jobs:
           fi
 
       - name: Reconcile marks vs on-disk files
+        id: reconcile
+        # H9 fault isolation (R2 P2-3): reconcile is a DB-housekeeping pass
+        # between restore and Phase 1 — a crash here used to skip the ENTIRE
+        # crawl + data-preservation chain (the 2026-10-13→15 cascade class,
+        # from a step H9 round 1 missed). Marks stay as restored; the crawl
+        # phases still run; RECONCILE_FAILED re-raises red after backup.
+        continue-on-error: true
+        timeout-minutes: 15
         run: |
           if [ -f data/catalog.db ]; then
             python3 -m rh_catalog.cli reconcile
           else
             echo "No DB yet — skipping reconcile"
+          fi
+
+      - name: Record reconcile step status
+        run: |
+          outcome="${{ steps.reconcile.outcome }}"
+          echo "reconcile outcome: ${outcome}"
+          if [ "${outcome}" = "failure" ]; then
+            echo "RECONCILE_FAILED=true" >> "$GITHUB_ENV"
+            echo "::warning::Reconcile failed (deferred). Marks stay as restored; the crawl phases still run (missing-driven against the restored marks). The run will be marked failed AFTER data backup so the cron-failure alert fires."
+          else
+            echo "RECONCILE_FAILED=false" >> "$GITHUB_ENV"
           fi
 
       - name: Phase 1 — Tag tree
@@ -426,6 +458,7 @@ jobs:
         # Cosmetic — a stats crash (the §31 NULL-key class) must never
         # hard-fail the chain again.
         continue-on-error: true
+        timeout-minutes: 2
         run: python3 -m rh_catalog.cli stats
 
       - name: Phase 3 — Detail crawl
@@ -674,6 +707,7 @@ jobs:
       - name: Show final stats
         # Cosmetic — same §31-class protection as the mid-list stats step.
         continue-on-error: true
+        timeout-minutes: 2
         run: python3 -m rh_catalog.cli stats
 
       - name: Phase 7 — Sync to Turso (native SDK, best-effort)
@@ -1017,9 +1051,13 @@ jobs:
         # exactly how the 2026-09-01→02 GitLab-mirror wedge (silently green
         # for a month) gets surfaced: chunked_data_sync.py exports
         # DATA_PUSH_FAILED when any remote (origin/gitlab) failed to advance.
-        if: always() && (env.P1_TREE_FAILED == 'true' || env.LIST_CRAWL_FAILED == 'true' || env.CN_CRAWL_FAILED == 'true' || env.RECLASSIFY_FAILED == 'true' || env.DETAIL_CRAWL_FAILED == 'true' || env.EXPORT_CRAWL_FAILED == 'true' || env.ANALYZE_FAILED == 'true' || env.SNAPSHOT_FAILED == 'true' || env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.EDITOR_SURFACE_FAILED == 'true' || env.CANVAS_RESOURCES_FAILED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
+        if: always() && (env.RECONCILE_FAILED == 'true' || env.P1_TREE_FAILED == 'true' || env.LIST_CRAWL_FAILED == 'true' || env.CN_CRAWL_FAILED == 'true' || env.RECLASSIFY_FAILED == 'true' || env.DETAIL_CRAWL_FAILED == 'true' || env.EXPORT_CRAWL_FAILED == 'true' || env.ANALYZE_FAILED == 'true' || env.SNAPSHOT_FAILED == 'true' || env.TURSO_SYNC_FAILED == 'true' || env.MODELS_STEP_FAILED == 'true' || env.APPS_CRAWL_FAILED == 'true' || env.EDITOR_SURFACE_FAILED == 'true' || env.CANVAS_RESOURCES_FAILED == 'true' || env.CANVAS_RESOURCE_SURFACE_OPENED == 'true' || env.DATA_PUSH_FAILED == 'true' || env.NETLIFY_BACKUP_FAILED == 'true' || env.CODE_MIRROR_FAILED == 'true' || env.DIRECT_STEP_FAILED == 'true')
         run: |
           failed=0
+          if [ "${RECONCILE_FAILED:-false}" = "true" ]; then
+            echo "::error::Reconcile failed earlier in this run (H9 isolation, R2 P2-3). Data backup completed with the marks as restored — detail/export ran against the restored (possibly stale-local) marks. Reconcile re-runs next run; a persistent failure points at rh_catalog.cli reconcile itself."
+            failed=1
+          fi
           if [ "${P1_TREE_FAILED:-false}" = "true" ]; then
             echo "::error::Tag-tree phase failed earlier in this run (Phase 1 — deferred, H9 mid-chain isolation). Data backup completed; the workflow tag tree is stale this run. The next run re-walks it (cheap, one API call family)."
             failed=1
@@ -1182,6 +1220,7 @@ jobs:
             // job — they cannot lag. hasFailures/jobConclusion stay in the
             // OR-chain to catch direct step failures the flags don't cover.
             const deferredFailureRaised =
+              process.env.RECONCILE_FAILED === 'true' ||
               process.env.P1_TREE_FAILED === 'true' ||
               process.env.LIST_CRAWL_FAILED === 'true' ||
               process.env.CN_CRAWL_FAILED === 'true' ||
@@ -1591,4 +1630,80 @@ jobs:
                   core.info('Refresh succeeded and no open cron-failed issue to close.');
                 }
               }
+            }
+
+  refresh-skip-watchdog:
+    name: Refresh skipped watchdog
+    needs: [test, refresh]
+    # R2 P1-1 (2026-10-15, adversarial review of H9): `needs: test` gates
+    # the data-preservation job behind the test suite — a persistent red
+    # test job (pip outage, a hermetic regression, or the minutes-wide
+    # lockstep red-by-design window after a private push lands before the
+    # runner redeploy) SKIPS the refresh, and the alert step (which lives
+    # INSIDE the refresh job) never runs. The run-gap detector cannot see
+    # it either: a needs-skipped run concludes FAILURE, which it counts as
+    # "completed — still moved data". That is an indefinite silent data
+    # gap with no signal anywhere. This job closes the door: when the
+    # refresh did not run to completion on a schedule/dispatch event, it
+    # opens/comments the cron-failed tracking issue in the PRIVATE code
+    # repo (same GH_PAT routing as the in-job alert; the next green
+    # refresh auto-closes it, same lifecycle).
+    if: >-
+      always() &&
+      (needs.refresh.result == 'skipped' || needs.refresh.result == 'cancelled') &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write  # kept for a future alert that files HERE; the cross-repo
+                     # filing below authenticates via GH_PAT (own scopes).
+    steps:
+      - name: Alert — refresh job skipped or cancelled (no data moved)
+        uses: actions/github-script@v7
+        env:
+          REFRESH_RESULT: ${{ needs.refresh.result }}
+        with:
+          # GH_PAT (not GITHUB_TOKEN): tracking issues live in the PRIVATE
+          # beulahkemp/RH-workflow repo, which this runner repo's default
+          # token cannot touch (same routing as the in-job alert step).
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            // Tracking issues live in the private code repo — label + issue
+            // continuity with the in-job alert (cron-failed).
+            const alertOwner = 'beulahkemp';
+            const alertRepo = 'RH-workflow';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().slice(0, 10);
+            const result = (process.env.REFRESH_RESULT || 'unknown').toUpperCase();
+            const body = [
+              `**Refresh job ${result} — no data moved in this window**`,
+              '',
+              `**Trigger:** \`${context.eventName}\` | **Date:** ${today}`,
+              `**Run:** ${runUrl}`,
+              '',
+              'The Refresh catalog job did not run to completion, so crawl/shards/',
+              'Turso/data-repo-push all stayed stale for this window. Typical causes:',
+              'the TEST job failed (the refresh is gated behind it — check the run log),',
+              'the runner was cancelled, or a workflow-level error. This issue closes',
+              'automatically once a refresh completes successfully (the in-job alert',
+              'step\'s green-run close path).',
+            ].join('\n');
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: alertOwner, repo: alertRepo, state: 'open', labels: 'cron-failed', per_page: 50,
+            });
+            const tracking = issues.data.filter((i) => !i.pull_request);
+            if (tracking.length > 0) {
+              await github.rest.issues.createComment({
+                owner: alertOwner, repo: alertRepo, issue_number: tracking[0].number, body,
+              });
+              core.info(`Commented on existing cron-failed issue #${tracking[0].number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: alertOwner, repo: alertRepo,
+                title: `Daily cron refresh failed (refresh ${result}) — ${today}`,
+                body,
+                labels: ['cron-failed'],
+              });
+              core.info(`Created cron-failed issue #${created.data.number}`);
             }
