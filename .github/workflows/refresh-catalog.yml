@@ -194,7 +194,7 @@ jobs:
             data/exports/
             data/details/
             data/snapshots/
-            data/resources/
+            # data/resources/ (H8: retired — per-KIND repos carry it now)
             data/resources_state.json
           key: rh-catalog-v3-${{ github.run_id }}
           restore-keys: |
@@ -290,11 +290,11 @@ jobs:
             # canvas resource store — the family JSONs + light assets carry
             # over from the data repo so the no-op emission discipline and
             # the camera chunk-hash skip survive an ephemeral runner.
-            if [ -d "$RH_DATA_REPO/resources/canvas" ] && [ ! -d data/resources/canvas ]; then
-              mkdir -p data/resources
-              cp -r "$RH_DATA_REPO/resources/canvas" data/resources/canvas
-              echo "Restored canvas resource store from data repo: $(find data/resources/canvas -type f | wc -l) files"
-            fi
+            # H8 (2026-10-15): the resources/canvas restore is RETIRED — the
+            # per-KIND repos (beulahkemp/RH-canvas-*) are the canonical home
+            # now; the data-repo copy was tombstoned. Phase 5.9 rebuilds its
+            # local store from the live walk + HAR import every run (it is a
+            # stale-by-design surface-health baseline, never data of record).
             # The data-repo working copies are redundant now (Phase 8 compares
             # against HEAD blobs and re-copies from data/ on change) — free
             # ~5.6GB. The shards/ tree STAYS: Phase 8's split rebuilds into it.
