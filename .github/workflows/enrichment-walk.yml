@@ -1,0 +1,325 @@
+name: D11+J13 Enrichment Walk
+
+# R11 (session #31, 2026-10-23): the D11 workflow-detail re-walk + J13 creation-outputs
+# metadata walk, executed on THIS public runner (the sandbox can't hold 15-30min jobs;
+# ~254k requests total; ~80-135 min/shard at concurrency 8 on a 4-way matrix).
+#
+# Per workflow id from the catalog shards:
+#   POST /api/portal/workflow/detail            -> RH-workflow-details (kind repo)
+#   POST /api/portal/creation/list (+paginate)   -> RH-community data/creations/ (metadata only)
+#
+# Review r2 (adversarial, 2026-10-23) folded: F1 seed-resume (output file is FULL state),
+# F2 creations merge, F3 poison-burst breaker + push gates, F4 verified zstd resume,
+# F5 resume artifacts quarantined, F6 stale-parts cleanup, F7 matrix guard, F8 !cancelled()
+# checkpointing, F9 parts-aware resume, F10 proven push loop, F11 raw URL, F14 partial
+# finalize w/ failed_shards, F16 df gates + LFS-skip + post-walk cleanup, F17/F22 clamped
+# ramp (first dispatch at 4), F23 staggered starts, F25 split records in INDEX.
+#
+# RESUME MODEL: the details repo's data/details-XX.jsonl.zst IS the full shard state;
+# a re-run seeds /tmp/out from it (err ids dropped, gone/ok kept), walks only the rest,
+# and pushes the merged file. Creations merge by id-disjoint concatenation.
+#
+# Timing ledger: clone ~4-8 min; walk ~80-135 min/shard at c=8 (~265 min worst-case);
+# compress < 5 min; pushes ~10-20 min. First dispatch: max_ids=2000, concurrency=4.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_ids:
+        description: "Cap ids per shard (0 = full catalog walk; use 2000 for the smoke)"
+        required: false
+        default: "0"
+      concurrency:
+        description: "Per-shard HTTP concurrency (1-16; 4 for a first/full-dispatch ramp)"
+        required: false
+        default: "8"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: enrichment-walk
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout main repo (walker lives there)
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/RH-workflow
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Syntax + smoke (tiny synthetic shard, both domains)
+        run: |
+          python3 -m py_compile scripts/r11/r11_enrichment_walk.py && echo "py_compile OK"
+          python3 -m pip install -q "httpx>=0.27" || pip install -q "httpx>=0.27"
+          python3 - <<'EOF'
+          import sqlite3, os
+          os.makedirs('/tmp/mini/shards', exist_ok=True)
+          con = sqlite3.connect('/tmp/mini/shards/a-0000.db')
+          con.execute("CREATE TABLE workflow (id TEXT PRIMARY KEY, source_domain TEXT)")
+          # both domains so the .cn Origin-header path is exercised (F20)
+          con.executemany("INSERT INTO workflow (id, source_domain) VALUES (?, ?)",
+                          [("1991530280437628929", "ai"), ("2027204046305628162", "ai")])
+          con.commit()
+          EOF
+          python3 scripts/r11/r11_enrichment_walk.py --shard 0 --of 1 --data-repo /tmp/mini \
+            --out /tmp/out-smoke --concurrency 2 --max 2
+          test -s /tmp/out-smoke/details-00.jsonl && echo "smoke OK"
+
+  walk:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      MAIN_REPO: beulahkemp/RH-workflow
+      DATA_REPO: beulahkemp/RH-workflow-data
+      DETAILS_REPO: beulahkemp/RH-workflow-details
+      COMMUNITY_REPO: beulahkemp/RH-community
+    steps:
+      - name: Stagger matrix starts (F23) + guard matrix size
+        run: |
+          sleep $(( ${{ matrix.shard }} * 45 ))
+          df -h / | tail -1
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Checkout main repo (walker + package)
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/RH-workflow
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps + clamp concurrency (F22)
+        run: |
+          python3 -m pip install -q "httpx>=0.27"
+          CONC=${{ inputs.concurrency }}
+          [ "$CONC" -ge 1 ] && [ "$CONC" -le 16 ] || { echo "::error::concurrency must be 1-16"; exit 1; }
+          echo "CONC=$CONC" >> "$GITHUB_ENV"
+
+      - name: Clone data repo (catalog shards — read-only source)
+        timeout-minutes: 20
+        run: |
+          export GIT_LFS_SKIP_SMUDGE=1
+          git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/${DATA_REPO}.git" /tmp/rh-data
+          python3 - <<'EOF'
+          import sqlite3, glob
+          n = 0
+          for db in sorted(glob.glob('/tmp/rh-data/shards/*.db')):
+              con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+              n += con.execute("SELECT COUNT(*) FROM workflow").fetchone()[0]
+              con.close()
+          print(f"catalog rows (all shards): {n}")
+          assert n > 100000, "catalog enumeration looks wrong"
+          EOF
+          df -h / | tail -1
+
+      - name: Resume — download existing shard output if any (F4/F5/F9/F11)
+        timeout-minutes: 20
+        run: |
+          mkdir -p /tmp/resume /tmp/out
+          rm -f /tmp/resume/*
+          SHARD2=$(printf %02d ${{ matrix.shard }})
+          echo "SHARD2=$SHARD2" >> "$GITHUB_ENV"
+          base="https://raw.githubusercontent.com/${DETAILS_REPO}/main/data/details-${SHARD2}"
+          for ext in jsonl.zst jsonl; do
+            if curl -sfL -m 900 -H "Authorization: Bearer ${GH_PAT}" -o /tmp/resume/resume.bin "$base.$ext" && [ -s /tmp/resume/resume.bin ]; then
+              if [ "$ext" = "jsonl.zst" ]; then
+                if zstd -d -f -o /tmp/resume/details-resume.jsonl /tmp/resume/resume.bin 2>/dev/null; then
+                  rm -f /tmp/resume/resume.bin; touch /tmp/resume/OK; break
+                fi
+                echo "::warning::zstd failed on downloaded resume (corrupt?) — trying next form"
+                rm -f /tmp/resume/resume.bin /tmp/resume/details-resume.jsonl
+              else
+                mv /tmp/resume/resume.bin /tmp/resume/details-resume.jsonl && touch /tmp/resume/OK && break
+              fi
+            fi
+          done
+          if [ ! -f /tmp/resume/OK ]; then
+            p=0; rm -f /tmp/resume/parts.bin
+            while curl -sfL -m 900 -H "Authorization: Bearer ${GH_PAT}" -o "/tmp/resume/p.$p" "$base.jsonl.zst.$(printf %02d $p).part"; do
+              cat "/tmp/resume/p.$p" >> /tmp/resume/parts.bin; rm -f "/tmp/resume/p.$p"; p=$((p+1))
+              [ "$p" -ge 40 ] && break
+            done
+            if [ -s /tmp/resume/parts.bin ] && zstd -d -f -o /tmp/resume/details-resume.jsonl /tmp/resume/parts.bin 2>/dev/null; then
+              touch /tmp/resume/OK
+            else
+              echo "no usable resume file — full shard walk"
+            fi
+          fi
+          [ -f /tmp/resume/OK ] && echo "resume: $(wc -l < /tmp/resume/details-resume.jsonl) ids"
+
+      - name: Walk shard (D11 details + J13 creations metadata; seed = full state — F1)
+        timeout-minutes: 270
+        run: |
+          RESUME_ARG=""
+          if [ -f /tmp/resume/OK ]; then
+            RESUME_ARG="--resume-from /tmp/resume/details-resume.jsonl"
+            grep -e '"detail"' -e '"gone"' /tmp/resume/details-resume.jsonl > "/tmp/out/details-${SHARD2}.jsonl"
+            echo "seeded $(wc -l < /tmp/out/details-${SHARD2}.jsonl) lines (err ids dropped for re-walk)"
+          fi
+          MAX_ARG=""
+          [ "${{ inputs.max_ids }}" != "0" ] && MAX_ARG="--max ${{ inputs.max_ids }}"
+          python3 scripts/r11/r11_enrichment_walk.py \
+            --shard ${{ matrix.shard }} --of 4 \
+            --data-repo /tmp/rh-data --out /tmp/out \
+            --concurrency "$CONC" $MAX_ARG $RESUME_ARG
+          echo "WALK_OK=1" >> "$GITHUB_ENV"
+          ls -la /tmp/out
+
+      - name: Compress + split (>95MB parts — F6 cleanup, F25 split records)
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f /tmp/out/POISONED ]; then
+            echo "::error::poison burst detected — refusing to compress/push this shard"
+            cat /tmp/out/POISONED
+            exit 1
+          fi
+          cd /tmp/out
+          echo "{}" > splits.json
+          for f in details-*.jsonl creations-*.jsonl; do
+            [ -f "$f" ] || continue
+            zstd -19 -T0 -f "$f" -o "$f.zst" && rm "$f"
+            sz=$(stat -c%s "$f.zst")
+            if [ "$sz" -gt 104857600 ]; then
+              split -b 95M -d --additional-suffix=.part "$f.zst" "$f.zst."
+              n=$(ls "$f.zst".* | wc -l)
+              rm "$f.zst"
+              python3 - "$f" "$n" <<'EOF'
+          import json, sys
+          with open('splits.json') as fh: s = json.load(fh)
+          s[sys.argv[1] + ".zst"] = int(sys.argv[2])
+          with open('splits.json', 'w') as fh: json.dump(s, fh, indent=1)
+          EOF
+              echo "$f.zst -> $n parts"
+            fi
+          done
+          ls -la /tmp/out
+          df -h / | tail -1
+
+      - name: Push details -> RH-workflow-details (seed-merge model — F1/F6)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/${DETAILS_REPO}.git" /tmp/details-repo
+          mkdir -p /tmp/details-repo/data
+          rm -f /tmp/details-repo/data/details-${SHARD2}.jsonl*   # kill stale singles AND stale parts
+          cp /tmp/out/details-${SHARD2}.jsonl.zst /tmp/details-repo/data/ 2>/dev/null \
+            || cp /tmp/out/details-${SHARD2}.jsonl.zst.* /tmp/details-repo/data/ 2>/dev/null \
+            || echo "no details output (empty shard?)"
+          cp /tmp/out/splits.json /tmp/details-repo/data/splits-${SHARD2}.json 2>/dev/null || true
+          if [ -n "$WALK_OK" ]; then cp /tmp/out/stats-${SHARD2}.json /tmp/details-repo/data/ 2>/dev/null || true; fi
+          cd /tmp/details-repo
+          git config user.name "enrichment-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "walk: shard ${{ matrix.shard }}/4 (run ${{ github.run_id }})"
+            for i in 1 2 3 4 5; do
+              if git push "https://beulahkemp:${GH_PAT}@github.com/${DETAILS_REPO}.git" HEAD:main; then break; fi
+              git pull --rebase --autostash "https://beulahkemp:${GH_PAT}@github.com/${DETAILS_REPO}.git" main || { git rebase --abort || true; }
+              sleep 20
+            done
+          fi
+
+      - name: Push creations -> RH-community (merge-by-disjoint-ids — F2)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: |
+          if compgen -G '/tmp/out/creations-*.zst*' > /dev/null; then
+            git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/${COMMUNITY_REPO}.git" /tmp/community-repo
+            mkdir -p /tmp/community-repo/data/creations
+            SHARD2C=$(printf %02d ${{ matrix.shard }})
+            OLD=/tmp/community-repo/data/creations/creations-${SHARD2C}.jsonl.zst
+            if [ -f "$OLD" ]; then
+              zstd -d -f "$OLD" -o /tmp/resume/creations-merged.jsonl && rm -f "$OLD" "$OLD".*
+              [ -f "/tmp/out/creations-${SHARD2C}.jsonl.zst" ] && zstd -dc "/tmp/out/creations-${SHARD2C}.jsonl.zst" >> /tmp/resume/creations-merged.jsonl
+              compgen -G "/tmp/out/creations-${SHARD2C}.jsonl.zst.*" > /dev/null && cat /tmp/out/creations-${SHARD2C}.jsonl.zst.* | zstd -dc >> /tmp/resume/creations-merged.jsonl
+              mv /tmp/resume/creations-merged.jsonl "/tmp/out/creations-${SHARD2C}.jsonl"
+              rm -f "/tmp/out/creations-${SHARD2C}.jsonl.zst" "/tmp/out/creations-${SHARD2C}.jsonl.zst".*
+              zstd -19 -T0 -f "/tmp/out/creations-${SHARD2C}.jsonl" -o "/tmp/out/creations-${SHARD2C}.jsonl.zst" && rm "/tmp/out/creations-${SHARD2C}.jsonl"
+            fi
+            cp /tmp/out/creations-*.zst /tmp/community-repo/data/creations/ 2>/dev/null \
+              || cp /tmp/out/creations-*.zst.* /tmp/community-repo/data/creations/ 2>/dev/null
+            cd /tmp/community-repo
+            git config user.name "enrichment-bot"
+            git config user.email "actions@users.noreply.github.com"
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -m "J13 walk: creations metadata shard ${{ matrix.shard }}/4 (run ${{ github.run_id }})"
+              for i in 1 2 3 4 5; do
+                if git push "https://beulahkemp:${GH_PAT}@github.com/${COMMUNITY_REPO}.git" HEAD:main; then break; fi
+                git pull --rebase --autostash "https://beulahkemp:${GH_PAT}@github.com/${COMMUNITY_REPO}.git" main || { git rebase --abort || true; }
+                sleep 20
+              done
+            fi
+          else
+            echo "no creations output this shard"
+          fi
+          rm -rf /tmp/rh-data || true   # free the ~3GB clone (F16)
+          df -h / | tail -1
+
+  finalize:
+    needs: walk
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Per-shard validation + INDEX (partial-completion aware — F14)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DETAILS_REPO: beulahkemp/RH-workflow-details
+        run: |
+          git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/${DETAILS_REPO}.git" /tmp/dr
+          python3 - <<'EOF'
+          import json, os, glob
+          agg = {"shards": {}, "failed_shards": [], "detail_ok": 0, "detail_gone": 0,
+                 "detail_err": 0, "wf_with_creations": 0, "creation_records": 0,
+                 "splits": {}}
+          present = sorted(glob.glob('/tmp/dr/data/stats-*.json'))
+          agg["failed_shards"] = [s for s in ("00","01","02","03") if f"/tmp/dr/data/stats-{s}.json" not in present]
+          for s in present:
+              with open(s) as f:
+                  st = json.load(f)
+              agg["shards"][os.path.basename(s)[6:8]] = st
+              for k in ("detail_ok", "detail_gone", "detail_err", "wf_with_creations", "creation_records"):
+                  agg[k] += st.get(k, 0)
+          for sp in glob.glob('/tmp/dr/data/splits-*.json'):
+              with open(sp) as f:
+                  agg["splits"].update(json.load(f))
+          agg["run_id"] = os.environ.get("GITHUB_RUN_ID", "")
+          with open('/tmp/dr/data/INDEX.json', 'w') as f:
+              json.dump(agg, f, indent=1)
+          print(json.dumps({k: v for k, v in agg.items() if k not in ("shards", "splits")}, indent=1))
+          missing = agg["failed_shards"]
+          if missing:
+              print(f"::warning::missing shard stats: {missing} (partial matrix — resume those shards)")
+          assert agg["detail_ok"] > 0, "no details landed anywhere — matrix failed"
+          EOF
+          cd /tmp/dr
+          git config user.name "enrichment-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "finalize: INDEX for run ${{ github.run_id }}" || true
+          for i in 1 2 3 4 5; do
+            if git push "https://beulahkemp:${GH_PAT}@github.com/${DETAILS_REPO}.git" HEAD:main; then break; fi
+            git pull --rebase --autostash "https://beulahkemp:${GH_PAT}@github.com/${DETAILS_REPO}.git" main || { git rebase --abort || true; }
+            sleep 20
+          done
