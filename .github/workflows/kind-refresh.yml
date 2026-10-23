@@ -1,0 +1,99 @@
+name: Kind-repo monthly refresh matrix
+
+# R10 (session #31, 2026-10-23): the RUNBOOK refresh cadence, automated. Every kind repo
+# that carries live product surfaces has tools/refresh.py with a standard exit contract:
+#   0 = no change · 1 = data changed (this job commits+pushes) · 2 = shape break (red run)
+#   · 3 = walk incomplete (red run)
+# The matrix is parallel per repo; a red job = the signal (issues are not auto-opened —
+# the monthly envelope check catches red runs; a shape-break means a family endpoint
+# changed and needs a manual probe round).
+#
+# Schedule: 2nd of each month, 03:17 UTC (away from the daily catalog window 09:07 UTC).
+# Manual dispatch also available (refresh_selected input = comma-separated repo names,
+# empty = all).
+
+on:
+  schedule:
+    - cron: '17 3 2 * *'
+  workflow_dispatch:
+    inputs:
+      refresh_selected:
+        description: "Comma-separated kind-repo names (empty = all)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kind-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [RH-gen-surface, RH-site-content, RH-llm-gateway, RH-commerce, RH-app-config, RH-comfy-resources, RH-community]
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - name: Selection gate
+        run: |
+          SEL="${{ inputs.refresh_selected }}"
+          if [ -n "$SEL" ]; then
+            case ",$SEL," in *",${{ matrix.repo }},"*) echo "selected";; *) echo "skipped (not in selection)"; exit 0;; esac
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Clone + run tools/refresh.py
+        run: |
+          export GIT_LFS_SKIP_SMUDGE=1
+          git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/${{ matrix.repo }}.git" /tmp/repo
+          cd /tmp/repo
+          python3 tools/refresh.py; RC=$?
+          echo "refresh rc=$RC (0=no-change 1=changed 2=shape-break 3=incomplete)"
+          if [ "$RC" -eq 2 ]; then echo "::error::SHAPE BREAK in ${{ matrix.repo }} — an endpoint family changed shape; manual probe round needed"; exit 1; fi
+          if [ "$RC" -eq 3 ]; then echo "::error::WALK INCOMPLETE in ${{ matrix.repo }} — retry or investigate"; exit 1; fi
+          if [ "$RC" -ne 1 ]; then exit 0; fi
+          echo "REFRESH_CHANGED=1" >> "$GITHUB_ENV"
+      - name: Commit + push (only when data changed)
+        if: env.REFRESH_CHANGED == '1'
+        run: |
+          cd /tmp/repo
+          git config user.name "refresh-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "monthly refresh: ${{ matrix.repo }} (run ${{ github.run_id }})" || exit 0
+          for i in 1 2 3 4 5; do
+            if git push "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/${{ matrix.repo }}.git" HEAD:main; then exit 0; fi
+            git pull --rebase --autostash "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/${{ matrix.repo }}.git" main || { git rebase --abort || true; }
+            sleep 20
+          done
+          echo "::error::push failed after retries"; exit 1
+
+  verify:
+    needs: refresh
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - name: Post-refresh verify on refreshed repos
+        run: |
+          for repo in RH-gen-surface RH-site-content RH-llm-gateway RH-commerce RH-app-config RH-comfy-resources RH-community; do
+            export GIT_LFS_SKIP_SMUDGE=1
+            git clone --depth 1 -q "https://beulahkemp:${GH_PAT}@github.com/beulahkemp/${repo}.git" "/tmp/$repo" 2>/dev/null || continue
+            if [ -f "/tmp/$repo/tools/verify.py" ]; then
+              if (cd "/tmp/$repo" && python3 tools/verify.py); then
+                echo "verify OK: $repo"
+              else
+                echo "::warning::verify FAILED: $repo"
+              fi
+            fi
+            rm -rf "/tmp/$repo"
+          done

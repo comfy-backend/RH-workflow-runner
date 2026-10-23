@@ -1,0 +1,106 @@
+name: Site-build canary (C09)
+
+# R10 (session #31, 2026-10-23): per-domain build canary, automated. R9 found the .ai/.cn
+# builds DIVERGED (31879150 vs 4098f01f); R10 found they RE-CONVERGED (db9dfd2d, 5.0.544)
+# and that appCommit rotates every few days. So the trip semantics are tiered:
+#   appVersion change  -> TRIP: update baseline, comment the alert (re-census decision)
+#   appCommit/buildId/entry-chunk rotation -> INFO comment only (expected churn)
+# Baselines live in RH-app-source r9-full/canary-{ai,cn}.json; this workflow updates them.
+#
+# Schedule: weekly, Monday 03:33 UTC. Manual dispatch also available.
+
+on:
+  schedule:
+    - cron: '33 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      APPSOURCE_REPO: beulahkemp/RH-app-source
+      ALERT_REPO: beulahkemp/RH-workflow
+    steps:
+      - name: Fetch both domains' build identity
+        run: |
+          python3 - <<'EOF'
+          import json, re, urllib.request, time
+          def fetch(dom):
+              req = urllib.request.Request(f"https://www.runninghub.{dom}/",
+                                           headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  html = r.read().decode("utf-8", "replace")
+              def one(pat):
+                  m = re.search(pat, html)
+                  return m.group(1) if m else None
+              time.sleep(1)
+              return {
+                  "appVersion": one(r'appVersion[\"\'?:= ]+([0-9.]{3,12})'),
+                  "appCommit": one(r'appCommit[\"\'?:= ]+([a-f0-9]{16,40})'),
+                  "buildId": one(r'buildId[\"\'?:= ]+\"?([0-9a-f-]{8,40})'),
+                  "entry_chunk_now": one(r'_nuxt/([A-Za-z0-9_-]{8})\.js'),
+              }
+          out = {"ai": fetch("ai"), "cn": fetch("cn"), "ts": time.time()}
+          with open("/tmp/now.json", "w") as f:
+              json.dump(out, f, indent=1)
+          print(json.dumps(out, indent=1))
+          EOF
+      - name: Compare vs baselines + update
+        run: |
+          export GIT_LFS_SKIP_SMUDGE=1
+          git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/${APPSOURCE_REPO}.git" /tmp/appsource
+          python3 - <<'EOF'
+          import json, os
+          now = json.load(open("/tmp/now.json"))
+          trips, infos = [], []
+          for dom in ("ai", "cn"):
+              p = f"/tmp/appsource/r9-full/canary-{dom}.json"
+              old = json.load(open(p))
+              n = now[dom]
+              if n["appVersion"] and n["appVersion"] != old.get("appVersion"):
+                  trips.append(f"{dom}: appVersion {old.get('appVersion')} -> {n['appVersion']}")
+              if n["appCommit"] and n["appCommit"][:16] != (old.get("appCommit") or "")[:16]:
+                  infos.append(f"{dom}: appCommit {old.get('appCommit','?')[:12]} -> {n['appCommit'][:12]}")
+              if n["buildId"] and n["buildId"] != old.get("buildId"):
+                  infos.append(f"{dom}: buildId rotated -> {n['buildId']}")
+              new = dict(old); new.update({k: v for k, v in n.items() if v})
+              new["canary_checked_at"] = now["ts"]
+              new["canary_history"] = (old.get("canary_history") or [])[-19:] + [{
+                  "ts": now["ts"], "appVersion": n["appVersion"], "appCommit": n["appCommit"],
+                  "buildId": n["buildId"], "entry_chunk": n["entry_chunk_now"]}]
+              json.dump(new, open(p, "w"), indent=1)
+          with open("/tmp/trips.txt", "w") as f:
+              f.write("\n".join(trips))
+          print("TRIPS:", trips)
+          print("INFOS:", infos)
+          EOF
+          cd /tmp/appsource
+          git config user.name "canary-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "canary: baselines updated (run ${{ github.run_id }})"
+            for i in 1 2 3 4 5; do
+              if git push "https://beulahkemp:${GH_PAT}@github.com/${APPSOURCE_REPO}.git" HEAD:main; then break; fi
+              git pull --rebase --autostash "https://beulahkemp:${GH_PAT}@github.com/${APPSOURCE_REPO}.git" main || { git rebase --abort || true; }
+              sleep 20
+            done
+          fi
+      - name: Alert on version TRIP (comment on the private tracker repo)
+        if: ${{ hashFiles('/tmp/trips.txt') != '' }}
+        run: |
+          TRIPS=$(cat /tmp/trips.txt)
+          if [ -n "$TRIPS" ]; then
+            BODY="{\"body\": \"C09 canary TRIP (run ${{ github.run_id }}):\n$TRIPS\n\nThe main-site build version changed — decide whether to re-run the endpoint census (new chunks may reference new endpoint families). Baselines updated by the canary job.\"}"
+            curl -sf -X POST -H "Authorization: Bearer ${GH_PAT}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${ALERT_REPO}/issues" \
+              -d "{\"title\": \"C09 canary trip: site version rotated\", \"body\": \"${TRIPS//$'\n'/ }\n\n(Auto-opened by the site-canary workflow, run ${{ github.run_id }}.)\"}" \
+              && echo "alert issue opened"
+          else
+            echo "no version trips — commit-rotation info only"
+          fi
