@@ -174,7 +174,7 @@ jobs:
               echo "no usable resume file — full shard walk"
             fi
           fi
-          [ -f /tmp/resume/OK ] && echo "resume: $(wc -l < /tmp/resume/details-resume.jsonl) ids"
+          if [ -f /tmp/resume/OK ]; then echo "resume: $(wc -l < /tmp/resume/details-resume.jsonl) ids"; else echo "full shard walk (no resume)"; fi
 
       - name: Walk shard (D11 details + J13 creations metadata; seed = full state — F1)
         timeout-minutes: 270
