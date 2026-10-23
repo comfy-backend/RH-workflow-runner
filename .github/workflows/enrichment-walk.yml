@@ -59,14 +59,18 @@ jobs:
           python3 -m py_compile scripts/r11/r11_enrichment_walk.py && echo "py_compile OK"
           python3 -m pip install -q "httpx>=0.27" || pip install -q "httpx>=0.27"
           python3 - <<'EOF'
-          import sqlite3, os
+          import sqlite3, os, json
           os.makedirs('/tmp/mini/shards', exist_ok=True)
-          con = sqlite3.connect('/tmp/mini/shards/a-0000.db')
+          # W-FAMILY shape (R10 lesson: the data repo is family-sharded — a-*=apps, m-*=models,
+          # w-*=workflows; the manifest names the driver tables)
+          con = sqlite3.connect('/tmp/mini/shards/w-0000.db')
           con.execute("CREATE TABLE workflow (id TEXT PRIMARY KEY, source_domain TEXT)")
-          # both domains so the .cn Origin-header path is exercised (F20)
           con.executemany("INSERT INTO workflow (id, source_domain) VALUES (?, ?)",
                           [("1991530280437628929", "ai"), ("2027204046305628162", "ai")])
           con.commit()
+          json.dump({"families": {"W": {"driver": "workflow.id", "prefix": "w-",
+                                        "tables": {"workflow": "id"}}}},
+                    open('/tmp/mini/shards/MANIFEST.json', 'w'))
           EOF
           python3 scripts/r11/r11_enrichment_walk.py --shard 0 --of 1 --data-repo /tmp/mini \
             --out /tmp/out-smoke --concurrency 2 --max 2
@@ -120,13 +124,19 @@ jobs:
           export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 "https://beulahkemp:${GH_PAT}@github.com/${DATA_REPO}.git" /tmp/rh-data
           python3 - <<'EOF'
-          import sqlite3, glob
+          import sqlite3, glob, json
           n = 0
-          for db in sorted(glob.glob('/tmp/rh-data/shards/*.db')):
+          try:
+              fam = (json.load(open('/tmp/rh-data/shards/MANIFEST.json')).get('families') or {}).get('W') or {}
+              files = sorted(glob.glob(f"/tmp/rh-data/shards/{fam.get('prefix','w-')}*.db"))
+          except Exception:
+              files = sorted(glob.glob('/tmp/rh-data/shards/w-*.db'))
+          assert files, "no workflow-family shards found"
+          for db in files:
               con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
               n += con.execute("SELECT COUNT(*) FROM workflow").fetchone()[0]
               con.close()
-          print(f"catalog rows (all shards): {n}")
+          print(f"catalog rows (workflow family shards): {n} across {len(files)} files")
           assert n > 100000, "catalog enumeration looks wrong"
           EOF
           df -h / | tail -1
