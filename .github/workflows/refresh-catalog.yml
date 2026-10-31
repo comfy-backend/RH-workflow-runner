@@ -101,6 +101,15 @@ on:
 permissions:
   contents: write  # required by the refresh job (commit + push); scoped per-job below
 
+# GL_FROZEN (2026-10-31, owner decision): the GitLab PAT expired
+# 2026-10-23 and the mirrors are FROZEN. While true, NO GitLab pushes are
+# attempted anywhere (guaranteed-401 noise buries real failures — SKILL
+# §22 lesson); gitlab-only push outcomes are warning-classified, never a
+# deferred failure. GitHub is the primary carrier; the Netlify-blob store
+# is the 3rd copy. Re-enable: fresh PAT in secrets + flip to "false".
+env:
+  GL_FROZEN: "true"
+
 concurrency:
   # Refresh runs (schedule/dispatch) serialize together. Test-only runs
   # (push/PR) get a UNIQUE group so they never queue behind a 1-hour refresh.
@@ -893,6 +902,10 @@ jobs:
         env:
           GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
         run: |
+          if [ "${GL_FROZEN:-false}" = "true" ]; then
+            echo "::warning::GL_FROZEN=true — GitLab mirror FROZEN by owner decision (PAT expired 2026-10-23). Skipping all GitLab pushes; GitHub is primary, the blob store is the 3rd copy."
+            exit 0
+          fi
           if [ -z "$GITLAB_PAT" ]; then
             echo "GITLAB_PAT not set — skipping GitLab push"
             exit 0

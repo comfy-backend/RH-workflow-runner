@@ -20,6 +20,11 @@ concurrency:
   group: smoke-${{ github.run_id }}
   cancel-in-progress: false
 
+# GL_FROZEN (2026-10-31): mirrors frozen by owner decision (PAT expired
+# 2026-10-23) — the GitLab credential check below is advisory while true.
+env:
+  GL_FROZEN: "true"
+
 jobs:
   smoke:
     name: Connectivity smoke test
@@ -138,10 +143,18 @@ jobs:
         # R5-B P1 (2026-09-30): the canary wedging red SKIPPED these
         # liveness checks silently — a red canary must not blind the
         # GitLab-credential and alert-path verifiers too.
+        # R11 (2026-10-31): ADVISORY under GL_FROZEN — the PAT is dead by
+        # owner decision (mirrors frozen 2026-10-23); a permanent 401 here
+        # reddened every smoke run and buried real signal. Un-frozen: the
+        # check goes back to FATAL on non-403 failures.
         if: always()
         env:
           GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
         run: |
+          if [ "${GL_FROZEN:-false}" = "true" ]; then
+            echo "::warning::GL_FROZEN=true — GitLab credential check SKIPPED (PAT expired 2026-10-23; mirrors frozen by owner decision). GitHub is primary; the blob store is the 3rd copy."
+            exit 0
+          fi
           # Single polite API call; WAF 403s are retried by the production
           # push step, not here — this is an auth sanity check.
           code=$(curl -s -o /tmp/gl_user.json -w "%{http_code}" \
